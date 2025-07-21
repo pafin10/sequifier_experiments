@@ -116,6 +116,7 @@ class TransformerModel(nn.Module):
         super().__init__()
         self.project_path = hparams.project_path
         self.model_type = "Transformer"
+        #breakpoint()
         self.model_name = hparams.model_name or uuid.uuid4().hex[:8]
 
         self.selected_columns = hparams.selected_columns
@@ -129,7 +130,9 @@ class TransformerModel(nn.Module):
             for col in hparams.real_columns
             if self.selected_columns is None or col in self.selected_columns
         ]
-
+        #breakpoint()
+        self.use_positional_encoding = hparams.model_spec.use_positional_encoding
+        self.use_embedding = hparams.model_spec.use_embedding
         self.target_columns = hparams.target_columns
         self.target_column_types = hparams.target_column_types
         self.loss_weights = hparams.training_spec.loss_weights
@@ -162,12 +165,14 @@ class TransformerModel(nn.Module):
         self.real_columns_with_embedding = []
         self.real_columns_direct = []
         for col in self.real_columns:
-            if self.d_model_by_column[col] > 1:
+            if self.d_model_by_column[col] > 1 and self.use_embedding:
                 self.encoder[col] = nn.Linear(1, self.d_model_by_column[col])
                 self.real_columns_with_embedding.append(col)
             else:
-                assert self.d_model_by_column[col] == 1
+                print("Using real column without embedding:", col)
                 self.real_columns_direct.append(col)
+        
+
             self.pos_encoder[col] = nn.Embedding(
                 self.seq_length, self.d_model_by_column[col]
             )
@@ -214,7 +219,7 @@ class TransformerModel(nn.Module):
             self.device
         )
 
-        self._init_weights()
+        self._init_weights() # Initialize weights - modify this function!
         self.optimizer = self._get_optimizer(
             **self._filter_key(hparams.training_spec.optimizer, "name")
         )
@@ -224,9 +229,11 @@ class TransformerModel(nn.Module):
 
         self.iter_save = hparams.training_spec.iter_save
         self.continue_training = hparams.training_spec.continue_training
-        load_string = self._load_weights_conditional()
+        load_string = self._load_weights_conditional() #checkpoint loading
         self._initialize_log_file()
         self.log_file.write(load_string)
+        self.log_file.write("Using model {} positional encoding and {} embedding".format("with" if self.use_positional_encoding
+                else "without", "with" if self.use_embedding else "without"))
 
     @beartype
     def _init_criterion(self, hparams: Any) -> dict[str, Any]:
@@ -323,14 +330,24 @@ class TransformerModel(nn.Module):
             src_p = self.pos_encoder[col](pos)
 
             src_c = self.drop(src_t + src_p)
-
             srcs.append(src_c)
 
         for col in self.real_columns:
             if col in self.real_columns_direct:
-                src_t = src[col].T.unsqueeze(2).repeat(1, 1, 1) * math.sqrt(
-                    self.embedding_size
-                )
+                if self.use_embedding:
+                    src_t = src[col].T.unsqueeze(2).repeat(1, 1, 1) * math.sqrt(
+                        self.embedding_size
+                    )
+                else: 
+                    num_cols = len(self.real_columns_direct)
+                    assert self.embedding_size % num_cols == 0, (
+                        f"Embedding size {self.embedding_size} must be a multiple of the number of real columns {num_cols}"
+                    )
+                    rep = self.embedding_size // num_cols
+                    x = src[col].T.unsqueeze(-1) # (B, L, 1)
+                    src_t_col = x.repeat(1, 1, rep)
+
+                    src_t = src_t_col * math.sqrt(self.embedding_size)
             else:
                 assert col in self.real_columns_with_embedding
                 src_t = self.encoder[col](src[col].T[:, :, None]) * math.sqrt(
@@ -342,10 +359,12 @@ class TransformerModel(nn.Module):
                 .repeat(src_t.shape[1], 1)
                 .T
             )
-
             src_p = self.pos_encoder[col](pos)
 
-            src_c = self.drop(src_t + src_p)
+            if self.use_positional_encoding: 
+                src_c = self.drop(src_t + src_p)
+            else: 
+                src_c = self.drop(src_t)
 
             srcs.append(src_c)
 
