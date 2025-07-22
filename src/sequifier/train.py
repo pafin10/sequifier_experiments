@@ -15,6 +15,7 @@ from beartype import beartype
 from torch import Tensor, nn
 from torch.nn import ModuleDict, TransformerEncoder, TransformerEncoderLayer
 from torch.nn.functional import one_hot
+import torch.nn.init as init
 
 torch._dynamo.config.suppress_errors = True
 from sequifier.config.train_config import load_train_config  # noqa: E402
@@ -293,16 +294,30 @@ class TransformerModel(nn.Module):
 
     @beartype
     def _init_weights(self) -> None:
-        init_std = 0.02
+        # fan_in mode, nonlinearity='relu' is ideal for ReLU nets
         for col in self.categorical_columns:
-            self.encoder[col].weight.data.normal_(mean=0.0, std=init_std)
+            init.kaiming_normal_(
+                self.encoder[col].weight,
+                mode="fan_in",
+                nonlinearity="relu"
+            )
 
         for target_column in self.target_columns:
+            # biases to zero
             self.decoder[target_column].bias.data.zero_()
-            self.decoder[target_column].weight.data.normal_(mean=0.0, std=init_std)
+            # Kaiming on decoder weights
+            init.kaiming_normal_(
+                self.decoder[target_column].weight,
+                mode="fan_in",
+                nonlinearity="relu"
+            )
 
         for col_name in self.pos_encoder:
-            self.pos_encoder[col_name].weight.data.normal_(mean=0.0, std=init_std)
+            init.kaiming_normal_(
+                self.pos_encoder[col_name].weight,
+                mode="fan_in",
+                nonlinearity="relu"
+            )
 
     @beartype
     def _recursive_concat(self, srcs: list[Tensor]):
