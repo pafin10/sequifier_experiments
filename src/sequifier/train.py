@@ -15,6 +15,7 @@ from beartype import beartype
 from torch import Tensor, nn
 from torch.nn import ModuleDict, TransformerEncoder, TransformerEncoderLayer
 from torch.nn.functional import one_hot
+import torch.nn.functional as F
 import torch.nn.init as init
 
 torch._dynamo.config.suppress_errors = True
@@ -110,6 +111,32 @@ def format_number(number: Union[int, float, np.float32]) -> str:
     number_adjusted = number * (10 ** (-order_of_magnitude))
     return f"{number_adjusted:5.2f}e{order_of_magnitude}"
 
+class RegionAttention(nn.Module):   
+    @beartype
+    def __init__(self, d_embed: int, d_model: int, nhead: int, dropout: float):
+        super().__init__()
+        self.d_embed = d_embed
+        self.d_model = d_model
+        self.nhead = nhead
+        self.drop = dropout
+        self.d_head = d_model // nhead
+        
+        self.scale = math.sqrt(self.d_head)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+    
+    def forward(self, Q_i: Tensor, K_all: Tensor, V_all: Tensor) -> Tensor:
+        T, B = Q_i.shape[:2]  # T = sequence length, V = batch size
+
+        Q = Q_i.view(T, B, self.nhead, self.d_head)  # with d_head = d_model // num_heads
+        K = K_all.view(T, B, self.nhead, self.d_head)
+        V = V_all.view(T, B, self.nhead, self.d_head)
+
+        # TODO: Continue here!
+        # Attention scores
+        attn_scores = torch.einsum("thbd,thbd->thb", Q, K) / self.scale  # [T, H, B]
+        attn_weights = F.softmax(attn_scores, dim=0).unsqueeze(-1)       # [T, H, B, 1]
+
 
 class TransformerModel(nn.Module):
     @beartype
@@ -131,9 +158,10 @@ class TransformerModel(nn.Module):
             for col in hparams.real_columns
             if self.selected_columns is None or col in self.selected_columns
         ]
-        #breakpoint()
+
         self.use_positional_encoding = hparams.model_spec.use_positional_encoding
         self.use_embedding = hparams.model_spec.use_embedding
+        self.use_cross_attention = hparams.model_spec.use_cross_attention
         self.target_columns = hparams.target_columns
         self.target_column_types = hparams.target_column_types
         self.loss_weights = hparams.training_spec.loss_weights
@@ -162,9 +190,10 @@ class TransformerModel(nn.Module):
             self.d_model_by_column = self._get_d_model_by_column(
                 self.embedding_size, self.categorical_columns, self.real_columns
             )
-
+        breakpoint()
         self.real_columns_with_embedding = []
-        self.real_columns_direct = []
+        self.real_columns_direct = []        
+
         for col in self.real_columns:
             if self.d_model_by_column[col] > 1 and self.use_embedding:
                 self.encoder[col] = nn.Linear(1, self.d_model_by_column[col])
@@ -193,6 +222,20 @@ class TransformerModel(nn.Module):
         self.transformer_encoder = TransformerEncoder(
             encoder_layers, hparams.model_spec.nlayers, enable_nested_tensor=False
         )
+
+        # Cross attention setup
+        if self.use_cross_attention:
+            self.R = len(self.real_columns_direct)  # Number of regions
+
+            # Define separate linear layers for Q, K, V
+            self.W_Q = nn.ModuleList([nn.Linear(self.d_model_by_column, self.embedding_size) for _ in range(self.R)])  # R = 16
+            self.W_K = nn.ModuleList([nn.Linear(self.d_model_by_column, self.d_model_by_column) for _ in range(self.R)])      # if per-region K
+            self.W_V = nn.ModuleList([nn.Linear(self.d_model_by_column, self.d_model_by_column) for _ in range(self.R)])      # if per-region K
+            
+            # One MHA per region
+            self.region_attention_mods = nn.ModuleList([RegionAttention(d_embed=self.d_model_by_column, d_model=self.embedding_size, 
+                    num_heads=hparams.model_spec.nhead, dropout=self.drop) for _ in range(self.R)])
+        
 
         self.decoder = ModuleDict()
         self.softmax = ModuleDict()
@@ -233,8 +276,8 @@ class TransformerModel(nn.Module):
         load_string = self._load_weights_conditional() #checkpoint loading
         self._initialize_log_file()
         self.log_file.write(load_string)
-        self.log_file.write("Using model {} positional encoding and {} embedding".format("with" if self.use_positional_encoding
-                else "without", "with" if self.use_embedding else "without"))
+        self.log_file.write("Using model {} positional encoding, {} embedding and {} cross-attention".format("with" if self.use_positional_encoding
+                else "without", "with" if self.use_embedding else "without", "with" if self.use_cross_attention else "without"))
 
     @beartype
     def _init_criterion(self, hparams: Any) -> dict[str, Any]:
@@ -368,6 +411,7 @@ class TransformerModel(nn.Module):
                 src_t = self.encoder[col](src[col].T[:, :, None]) * math.sqrt(
                     self.embedding_size
                 )
+                breakpoint()
 
             pos = (
                 torch.arange(0, self.seq_length, dtype=torch.long, device=self.device)
@@ -383,9 +427,26 @@ class TransformerModel(nn.Module):
 
             srcs.append(src_c)
 
-        src2 = self._recursive_concat(srcs)
+        if not self.use_cross_attention:
+            src2 = self._recursive_concat(srcs) # (T, B, d_model) = (90, 2000, 64)
+            output = self.transformer_encoder(src2, self.src_mask)
+        
+        else:
+            assert self.use_embedding, "Cross attention requires embedding to be used"
 
-        output = self.transformer_encoder(src2, self.src_mask)
+            Q = [self.W_Q[i](srcs[i]) for i in range(self.R)] # (self.R, B, T, d_model)
+            K = [self.W_K[j](srcs[j]) for j in range(self.R)] # (self.R, B, T, d_model_by_column)
+            V = [self.W_V[j](srcs[j]) for j in range(self.R)] # (self.R, B, T, d_model_by_column)
+
+            # Concatenate K and V across embedding dimension
+            K_all = torch.cat(K, dim=2)  # (B, T, d_model)
+            V_all = torch.cat(V, dim=2)  # (B, T, d_model)
+
+            attn_outputs = []
+            for i in range(self.R):
+                attn_outputs.append(self.region_attention_mods[i](Q[i], K_all, V_all))  # (B, T, d_model), for Q already correct
+
+        # not sure if this stays the same, I think it does 
         output = {
             target_column: self.decode(target_column, output)
             for target_column in self.target_columns

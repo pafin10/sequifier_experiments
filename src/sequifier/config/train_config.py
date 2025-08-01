@@ -248,6 +248,7 @@ class ModelSpecModel(BaseModel):
     nlayers: int
     use_positional_encoding: bool = True
     use_embedding: bool = True
+    use_cross_attention: bool = False   
 
     @validator("d_model_by_column")
     def validate_d_model_by_column(cls, v, values):
