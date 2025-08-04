@@ -6,7 +6,7 @@ import shutil
 from typing import Any, Optional, Union
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pyarrow.parquet as pq
 from beartype import beartype
 
@@ -62,16 +62,38 @@ class Preprocessor:
         data_columns = [
             col for col in data.columns if col not in ["sequenceId", "itemPosition"]
         ]
-        n_classes, id_maps, selected_columns_statistics, col_types = (
+        data, n_classes, id_maps, selected_columns_statistics, col_types = (
             self._process_columns(data, data_columns)
         )
         self._export_metadata(
             id_maps, n_classes, col_types, selected_columns_statistics
         )
 
-        data = data.sort_values(["sequenceId", "itemPosition"])
+        schema = {
+            "sequenceId": pl.Int64,
+            "subsequenceId": pl.Int64,
+            "inputCol": pl.String,
+        }
+
+        if (np.unique(list(col_types.values())) == np.array(["Int64"]))[0]:
+            sequence_position_type = pl.Int64
+        else:
+            assert np.all(
+                [
+                    type_.startswith("Int") or type_.startswith("Float")
+                    for type_ in col_types.values()
+                ]
+            )
+            sequence_position_type = pl.Float64
+
+        schema.update(
+            {str(i): sequence_position_type for i in range(seq_length - 1, -1, -1)}
+        )
+
+        data = data.sort(["sequenceId", "itemPosition"])
         self._process_batches(
             data,
+            schema,
             n_cores,
             seq_length,
             seq_step_sizes,
@@ -96,11 +118,11 @@ class Preprocessor:
         read_format: str,
         selected_columns: Optional[list[str]],
         max_rows: Optional[int],
-    ) -> pd.DataFrame:
+    ) -> pl.DataFrame:
         data = read_data(data_path, read_format, columns=selected_columns)
         assert (
-            data.isnull().sum().sum() == 0
-        ), f"NaN or null values not accepted: {data.isnull().sum(0)}"
+            data.null_count().sum().sum_horizontal().item() == 0
+        ), f"NaN or null values not accepted: {data.null_count()}"
         self.data_name_root = os.path.splitext(os.path.basename(data_path))[0]
 
         if selected_columns:
@@ -109,10 +131,12 @@ class Preprocessor:
                 for col in selected_columns
                 if col not in ["sequenceId", "itemPosition"]
             ]
-            data = data[["sequenceId", "itemPosition"] + selected_columns_filtered]
+            data = data.select(
+                ["sequenceId", "itemPosition"] + selected_columns_filtered
+            )
 
         if max_rows:
-            data = data.head(int(max_rows))
+            data = data.slice(0, int(max_rows))
 
         return data
 
@@ -129,8 +153,9 @@ class Preprocessor:
 
     @beartype
     def _process_columns(
-        self, data: pd.DataFrame, data_columns: list[str]
+        self, data: pl.DataFrame, data_columns: list[str]
     ) -> tuple[
+        pl.DataFrame,
         dict[str, int],
         dict[str, dict[Union[str, int], int]],
         dict[str, dict[str, float]],
@@ -141,27 +166,32 @@ class Preprocessor:
         float_data_columns = []
 
         for data_col in data_columns:
-            dtype = str(data[data_col].dtype)
-            if dtype in ["object", "int64"]:
+            dtype = data.schema[data_col]
+            if isinstance(dtype, (pl.String, pl.Utf8)) or isinstance(
+                dtype, (pl.Int8, pl.Int16, pl.Int32, pl.Int64)
+            ):
                 data, sup_id_map = replace_ids(data, column=data_col)
                 id_maps[data_col] = dict(sup_id_map)
-                n_classes[data_col] = len(np.unique(data[data_col])) + 1
-            elif dtype == "float64":
-                std = data[data_col].std()
-                mean = data[data_col].mean()
-                data[data_col] = (data[data_col].values - mean) / (std + 1e-9)
+                n_classes[data_col] = data.get_column(data_col).n_unique() + 1
+            elif isinstance(dtype, (pl.Float32, pl.Float64)):
+                std = data.get_column(data_col).std()
+                mean = data.get_column(data_col).mean()
+                data = data.with_columns(
+                    ((pl.col(data_col) - mean) / (std + 1e-9)).alias(data_col)
+                )
                 selected_columns_statistics[data_col] = {"std": std, "mean": mean}
                 float_data_columns.append(data_col)
             else:
                 raise ValueError(f"Column {data_col} has unsupported dtype: {dtype}")
 
-        col_types = {col: str(data[col].dtype) for col in data_columns}
-        return n_classes, id_maps, selected_columns_statistics, col_types
+        col_types = {col: str(data.schema[col]) for col in data_columns}
+        return data, n_classes, id_maps, selected_columns_statistics, col_types
 
     @beartype
     def _process_batches(
         self,
-        data: pd.DataFrame,
+        data: pl.DataFrame,
+        schema: Any,
         n_cores: Optional[int],
         seq_length: int,
         seq_step_sizes: list[int],
@@ -174,7 +204,8 @@ class Preprocessor:
         batches = [
             (
                 i,
-                data.iloc[start:end, :],
+                data.slice(start, end - start),
+                schema,
                 self.split_paths,
                 seq_length,
                 seq_step_sizes,
@@ -233,19 +264,19 @@ class Preprocessor:
 
 @beartype
 def replace_ids(
-    data: pd.DataFrame, column: str
-) -> tuple[pd.DataFrame, dict[Union[str, int], int]]:
+    data: pl.DataFrame, column: str
+) -> tuple[pl.DataFrame, dict[Union[str, int], int]]:
     ids = sorted(
         [int(x) if not isinstance(x, str) else x for x in np.unique(data[column])]
     )  # type: ignore
     id_map = {id_: i + 1 for i, id_ in enumerate(ids)}
-    data[column] = data[column].map(id_map)
-    return data, id_map  # type: ignore
+    data = data.with_columns(pl.col(column).replace(id_map))
+    return data, id_map
 
 
 @beartype
-def get_batch_limits(data: pd.DataFrame, n_batches: int) -> list[tuple[int, int]]:
-    sequence_ids = data["sequenceId"].values
+def get_batch_limits(data: pl.DataFrame, n_batches: int) -> list[tuple[int, int]]:
+    sequence_ids = data.get_column("sequenceId").to_numpy()
     new_sequence_id_indices = np.concatenate(
         [
             [0],
@@ -274,7 +305,7 @@ def get_batch_limits(data: pd.DataFrame, n_batches: int) -> list[tuple[int, int]
 
 
 @beartype
-def get_group_bounds(data_subset: pd.DataFrame, group_proportions: list[float]):
+def get_group_bounds(data_subset: pl.DataFrame, group_proportions: list[float]):
     n = data_subset.shape[0]
     upper_bounds = list((np.cumsum(group_proportions) * n).astype(int))
     lower_bounds = [0] + list(upper_bounds[:-1])
@@ -285,7 +316,8 @@ def get_group_bounds(data_subset: pd.DataFrame, group_proportions: list[float]):
 @beartype
 def preprocess_batch(
     process_id: int,
-    batch: pd.DataFrame,
+    batch: pl.DataFrame,
+    schema: Any,
     split_paths: list[str],
     seq_length: int,
     seq_step_sizes: list[int],
@@ -293,15 +325,16 @@ def preprocess_batch(
     group_proportions: list[float],
     write_format: str,
 ) -> None:
-    sequence_ids = sorted(list(np.unique(batch["sequenceId"])))
+    sequence_ids = sorted(batch.get_column("sequenceId").unique().to_list())
     written_files: dict[int, list[str]] = {i: [] for i in range(len(split_paths))}
     for i, sequence_id in enumerate(sequence_ids):
-        data_subset = batch.loc[batch["sequenceId"] == sequence_id, :]
+        data_subset = batch.filter(pl.col("sequenceId") == sequence_id)
         group_bounds = get_group_bounds(data_subset, group_proportions)
         sequences = {
             i: cast_columns_to_string(
                 extract_sequences(
-                    data_subset.iloc[lb:ub, :],
+                    data_subset.slice(lb, ub - lb),
+                    schema,
                     seq_length,
                     seq_step_sizes[i],
                     data_columns,
@@ -317,7 +350,7 @@ def preprocess_batch(
             split_path_batch_seq = insert_top_folder(split_path_batch_seq, "temp")
 
             if write_format == "csv":
-                write_data(split, split_path_batch_seq, "csv", mode="w", header=True)
+                write_data(split, split_path_batch_seq, "csv")
             elif write_format == "parquet":
                 write_data(split, split_path_batch_seq, "parquet")
 
@@ -338,18 +371,25 @@ def preprocess_batch(
 
 @beartype
 def extract_sequences(
-    data: pd.DataFrame, seq_length: int, seq_step_size: int, columns: list[str]
-) -> pd.DataFrame:
-    raw_sequences = (
-        data.groupby("sequenceId")
-        .agg({col: list for col in columns})
-        .reset_index(drop=False)
+    data: pl.DataFrame,
+    schema: Any,
+    seq_length: int,
+    seq_step_size: int,
+    columns: list[str],
+) -> pl.DataFrame:
+    if data.is_empty():
+        return pl.DataFrame(schema=schema)
+
+    raw_sequences = data.group_by("sequenceId", maintain_order=True).agg(
+        [pl.col(c) for c in columns]
     )
 
     rows = []
-    for _, in_row in raw_sequences.iterrows():
+    for in_row in raw_sequences.iter_rows(named=True):
+        in_seq_lists_only = {col: in_row[col] for col in columns}
+
         subsequences = extract_subsequences(
-            in_row[columns], seq_length, seq_step_size, columns
+            in_seq_lists_only, seq_length, seq_step_size, columns
         )
 
         for subsequence_id in range(len(subsequences[columns[0]])):
@@ -360,10 +400,10 @@ def extract_sequences(
                 assert len(row) == (seq_length + 3), f"{row = }"
                 rows.append(row)
 
-    sequences = pd.DataFrame(
+    sequences = pl.DataFrame(
         rows,
-        columns=["sequenceId", "subsequenceId", "inputCol"]
-        + list(range(seq_length - 1, -1, -1)),
+        schema=schema,
+        orient="row",
     )
     return sequences
 
@@ -385,18 +425,18 @@ def get_subsequence_starts(
 
 @beartype
 def extract_subsequences(
-    in_seq: pd.Series,  # col values are lists
+    in_seq: dict[str, list],
     seq_length: int,
     seq_step_size: int,
     columns: list[str],
 ) -> dict[str, list[list[Union[float, int]]]]:
-    if len(in_seq[columns[0]]) < seq_length:
-        in_seq = pd.Series(
-            {
-                col: ([0] * (seq_length - len(in_seq[col]))) + in_seq[col]
-                for col in columns
-            }
-        )
+    if not in_seq[columns[0]]:
+        return {col: [] for col in columns}
+
+    in_seq_len = len(in_seq[columns[0]])
+    if in_seq_len < seq_length:
+        pad_len = seq_length - in_seq_len
+        in_seq = {col: ([0] * pad_len) + in_seq[col] for col in columns}
     in_seq_length = len(in_seq[columns[0]])
 
     subsequence_starts = get_subsequence_starts(
@@ -417,7 +457,7 @@ def insert_top_folder(path: str, folder_name: str) -> str:
 
 
 @beartype
-def cast_columns_to_string(data: pd.DataFrame) -> pd.DataFrame:
+def cast_columns_to_string(data: pl.DataFrame) -> pl.DataFrame:
     data.columns = [str(col) for col in data.columns]
     return data
 

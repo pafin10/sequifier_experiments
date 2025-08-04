@@ -8,7 +8,7 @@ import warnings
 from typing import Any, Optional, Union
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import torch
 import torch._dynamo
 from beartype import beartype
@@ -101,7 +101,7 @@ def format_number(number: Union[int, float, np.float32]) -> str:
     Returns:
         A formatted string representation of the number.
     """
-    if pd.isnull(number):
+    if np.isnan(number):
         return "NaN"
     elif number == 0:
         order_of_magnitude = 0
@@ -318,6 +318,7 @@ class TransformerModel(nn.Module):
         real_columns: list[str],
     ) -> dict[str, int]:
         print(f"{len(categorical_columns) = } {len(real_columns) = }")
+        assert (len(categorical_columns) + len(real_columns)) > 0, "No columns found"
         if len(categorical_columns) == 0 and len(real_columns) > 0:
             d_model_by_column = {col: 1 for col in real_columns}
             column_index = dict(enumerate(real_columns))
@@ -524,7 +525,10 @@ class TransformerModel(nn.Module):
             if (
                 self.early_stopping_epochs is None
                 or n_epochs_no_improvement < self.early_stopping_epochs
-                or (epoch > self.start_epoch and not np.isnan(total_loss))  # type: ignore # noqa: F821
+            ) and (
+                epoch == self.start_epoch
+                or epoch > self.start_epoch
+                and not np.isnan(total_loss)  # type: ignore # noqa: F821
             ):
                 epoch_start_time = time.time()
                 self._train_epoch(X_train, y_train, epoch)
@@ -927,12 +931,16 @@ class TransformerModel(nn.Module):
 
         for categorical_column in self.class_share_log_columns:
             output_values = output[categorical_column].argmax(1).cpu().detach().numpy()
-            output_counts = pd.Series(output_values).value_counts().sort_index()
+            output_counts_df = (
+                pl.Series("values", output_values).value_counts().sort("values")
+            )
+            output_counts = output_counts_df.get_column("count")
+
             output_counts = output_counts / output_counts.sum()
             value_shares = " | ".join(
                 [
-                    f"{self.index_maps[categorical_column][value]}: {share:5.5f}"
-                    for value, share in output_counts.to_dict().items()
+                    f"{self.index_maps[categorical_column][row['values']]}: {row['count']:5.5f}"
+                    for row in output_counts_df.iter_rows(named=True)
                 ]
             )
             self.log_file.write(f"{categorical_column}: {value_shares}")
