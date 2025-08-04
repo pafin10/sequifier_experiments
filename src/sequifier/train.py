@@ -113,29 +113,40 @@ def format_number(number: Union[int, float, np.float32]) -> str:
 
 class RegionAttention(nn.Module):   
     @beartype
-    def __init__(self, d_embed: int, d_model: int, nhead: int, dropout: float):
+    def __init__(self, d_embed: int, d_model: int, num_heads: int, dropout: nn.Dropout):
         super().__init__()
         self.d_embed = d_embed
         self.d_model = d_model
-        self.nhead = nhead
+        self.nhead = num_heads
         self.drop = dropout
-        self.d_head = d_model // nhead
+        self.d_head = d_model // num_heads
         
         self.scale = math.sqrt(self.d_head)
         self.out_proj = nn.Linear(d_model, d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model),
+            nn.Dropout(self.drop.p),
+        )
 
     
     def forward(self, Q_i: Tensor, K_all: Tensor, V_all: Tensor) -> Tensor:
-        T, B = Q_i.shape[:2]  # T = sequence length, V = batch size
+        T, B = Q_i.shape[:2]  # T = sequence length, B = batch size
 
         Q = Q_i.view(T, B, self.nhead, self.d_head)  # with d_head = d_model // num_heads
         K = K_all.view(T, B, self.nhead, self.d_head)
         V = V_all.view(T, B, self.nhead, self.d_head)
 
-        # TODO: Continue here!
-        # Attention scores
-        attn_scores = torch.einsum("thbd,thbd->thb", Q, K) / self.scale  # [T, H, B]
-        attn_weights = F.softmax(attn_scores, dim=0).unsqueeze(-1)       # [T, H, B, 1]
+        # Compute attention 
+        attn_scores = torch.einsum("tbhd,sbhd->bhts", Q, K) / self.scale  # [B, H, T, S]
+        attn_weights = F.softmax(attn_scores, dim=-1)     # [B, H, T, S]
+        attn_out = torch.einsum("bhts,sbhd->tbhd", attn_weights, V)  # [T, B, H, d_head]
+        attn_out = attn_out.reshape(T, B, self.d_model)  # [T, B, d_model]
+        attn_out = self.drop(attn_out)
+        out = attn_out + self.ffn(attn_out)  # [ T, B, d_model ]
+        return out
+
 
 
 class TransformerModel(nn.Module):
@@ -144,7 +155,6 @@ class TransformerModel(nn.Module):
         super().__init__()
         self.project_path = hparams.project_path
         self.model_type = "Transformer"
-        #breakpoint()
         self.model_name = hparams.model_name or uuid.uuid4().hex[:8]
 
         self.selected_columns = hparams.selected_columns
@@ -190,7 +200,6 @@ class TransformerModel(nn.Module):
             self.d_model_by_column = self._get_d_model_by_column(
                 self.embedding_size, self.categorical_columns, self.real_columns
             )
-        breakpoint()
         self.real_columns_with_embedding = []
         self.real_columns_direct = []        
 
@@ -225,16 +234,19 @@ class TransformerModel(nn.Module):
 
         # Cross attention setup
         if self.use_cross_attention:
-            self.R = len(self.real_columns_direct)  # Number of regions
-
+            self.R = len(self.real_columns)  # Number of regions
+            self.d_col = self.d_model_by_column[self.real_columns[0]]  # Assuming all real columns have the same d_model_by_column
             # Define separate linear layers for Q, K, V
-            self.W_Q = nn.ModuleList([nn.Linear(self.d_model_by_column, self.embedding_size) for _ in range(self.R)])  # R = 16
-            self.W_K = nn.ModuleList([nn.Linear(self.d_model_by_column, self.d_model_by_column) for _ in range(self.R)])      # if per-region K
-            self.W_V = nn.ModuleList([nn.Linear(self.d_model_by_column, self.d_model_by_column) for _ in range(self.R)])      # if per-region K
+            self.W_Q = nn.ModuleList([nn.Linear(self.d_col, self.embedding_size) for _ in range(self.R)])  # R = 16
+            self.W_K = nn.ModuleList([nn.Linear(self.d_col, self.d_col) for _ in range(self.R)])      # if per-region K
+            self.W_V = nn.ModuleList([nn.Linear(self.d_col, self.d_col) for _ in range(self.R)])      # if per-region K
             
             # One MHA per region
-            self.region_attention_mods = nn.ModuleList([RegionAttention(d_embed=self.d_model_by_column, d_model=self.embedding_size, 
-                    num_heads=hparams.model_spec.nhead, dropout=self.drop) for _ in range(self.R)])
+            self.region_attention_mods = nn.ModuleList([RegionAttention(d_embed=self.d_col, d_model=self.embedding_size, 
+                    num_heads=self.R, dropout=self.drop) for _ in range(self.R)])
+            
+            # Project back to d_model
+            self.out_proj = nn.Linear(self.embedding_size * self.R, self.embedding_size)  
         
 
         self.decoder = ModuleDict()
@@ -276,8 +288,9 @@ class TransformerModel(nn.Module):
         load_string = self._load_weights_conditional() #checkpoint loading
         self._initialize_log_file()
         self.log_file.write(load_string)
-        self.log_file.write("Using model {} positional encoding, {} embedding and {} cross-attention".format("with" if self.use_positional_encoding
-                else "without", "with" if self.use_embedding else "without", "with" if self.use_cross_attention else "without"))
+        self.log_file.write("Using model with {} regions, {} positional encoding, {} embedding and {} cross-attention".format(len(self.real_columns),
+            "with" if self.use_positional_encoding else "without", "with" if self.use_embedding else "without", 
+            "with" if self.use_cross_attention else "without"))
 
     @beartype
     def _init_criterion(self, hparams: Any) -> dict[str, Any]:
@@ -411,7 +424,6 @@ class TransformerModel(nn.Module):
                 src_t = self.encoder[col](src[col].T[:, :, None]) * math.sqrt(
                     self.embedding_size
                 )
-                breakpoint()
 
             pos = (
                 torch.arange(0, self.seq_length, dtype=torch.long, device=self.device)
@@ -429,30 +441,53 @@ class TransformerModel(nn.Module):
 
         if not self.use_cross_attention:
             src2 = self._recursive_concat(srcs) # (T, B, d_model) = (90, 2000, 64)
-            output = self.transformer_encoder(src2, self.src_mask)
+            output = self.transformer_encoder(src2, self.src_mask) # (T, B, d_model) = (90, 2000, 64)
         
         else:
+            # TODO: Talk to Leon, figure out how to use hardware more efficiently, current B = 20 and ffn_hidden = ffn_in 
             assert self.use_embedding, "Cross attention requires embedding to be used"
 
             Q = [self.W_Q[i](srcs[i]) for i in range(self.R)] # (self.R, B, T, d_model)
-            K = [self.W_K[j](srcs[j]) for j in range(self.R)] # (self.R, B, T, d_model_by_column)
-            V = [self.W_V[j](srcs[j]) for j in range(self.R)] # (self.R, B, T, d_model_by_column)
+            K = [self.W_K[j](srcs[j]) for j in range(self.R)] # (self.R, B, T, d_col)
+            V = [self.W_V[j](srcs[j]) for j in range(self.R)] # (self.R, B, T, d_col)
+
+            T, B = Q[0].shape[:2]  # T = sequence length, B = batch size
 
             # Concatenate K and V across embedding dimension
             K_all = torch.cat(K, dim=2)  # (B, T, d_model)
             V_all = torch.cat(V, dim=2)  # (B, T, d_model)
+            """
+            # Pre-allocate tensor to hold all outputs
+            attn_outputs = torch.empty((T, B, self.R * self.embedding_size), device=self.device, dtype=torch.float32)
 
-            attn_outputs = []
             for i in range(self.R):
-                attn_outputs.append(self.region_attention_mods[i](Q[i], K_all, V_all))  # (B, T, d_model), for Q already correct
+                out_i = self.region_attention_mods[i](Q[i], K_all, V_all)  # [T, B, d_model]
+                attn_outputs[:, :, i * self.embedding_size : (i + 1) * self.embedding_size] = out_i
 
-        # not sure if this stays the same, I think it does 
+            output = self.out_proj(attn_outputs)  # (T, B, d_model)
+            
+            """
+            attn_outputs_cpu = []
+
+            for i in range(self.R):
+                out_i = self.region_attention_mods[i](Q[i], K_all, V_all)  # [T, B, d_model]
+                attn_outputs_cpu.append(out_i.cpu())  # Move to CPU immediately after computation
+
+            # Concatenate on CPU to avoid VRAM overload
+            attn_outputs = torch.cat(attn_outputs_cpu, dim=-1)  # [T, B, R * d_model]
+
+            # Move back to GPU only for final linear projection
+            attn_outputs = attn_outputs.to(self.device)
+
+            output = self.out_proj(attn_outputs)  # This projection is lightweight compared to FFN
+            
+
+         
         output = {
             target_column: self.decode(target_column, output)
             for target_column in self.target_columns
         }
-
-        return output
+        return output 
 
     @beartype
     def decode(self, target_column: str, output: Tensor) -> Tensor:
