@@ -123,6 +123,7 @@ class RegionAttention(nn.Module):
         self.R = num_regions
         
         self.scale = math.sqrt(self.d_head)
+        self.residual_proj = nn.Linear(d_embed, d_model)  # Project residuals to d_model
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
@@ -141,13 +142,20 @@ class RegionAttention(nn.Module):
 
     
     def forward(self, src_all: Tensor, q_region_index: int) -> Tensor: 
-        Q = self.W_Q(src_all[q_region_index])  # [B, T, d_model] - this is ok 
+        # src_all: [B, T, d_model] - all regions concatenated
+
+        src_all = src_all.transpose(0, 1)  # [T, B, d_model] 
+        start_idx = q_region_index * self.d_embed
+        end_idx = (q_region_index + 1) * self.d_embed
+        
+        Q = self.W_Q(src_all[:, :, start_idx:end_idx]) # select correct slice for query region 
         Q = Q.view(Q.shape[0], self.nhead, Q.shape[1], self.d_head)  # [B, H, T, d_head]
         
         Ks, Vs = [], []
         for i in range(self.R):
-            K = src_all[i] @ self.W_K[q_region_index][i] 
-            V = src_all[i] @ self.W_V[q_region_index][i]  
+            start, end = i * self.d_embed, (i + 1) * self.d_embed
+            K = src_all[:, :, start:end] @ self.W_K[q_region_index][i] 
+            V = src_all[:, :, start:end] @ self.W_V[q_region_index][i]  
             Ks.append(K)
             Vs.append(V)
         
@@ -161,7 +169,8 @@ class RegionAttention(nn.Module):
         B, _, T_q, _ = attn_out.shape
 
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T_q, self.d_model)
-        attn_out = self.norm1(src_all[q_region_index] + attn_out)
+        residual = self.residual_proj(src_all[:, :, start_idx:end_idx])
+        attn_out = self.norm1(residual + attn_out)
 
         # Feedforward + Residual + LayerNorm (region-wise FFN)
         ffn_out = self.ffn(attn_out)
@@ -187,9 +196,8 @@ class TransformerModel(nn.Module):
             if self.selected_columns is None or col in self.selected_columns
         ]
         self.real_columns = [
-            col
-            for col in hparams.real_columns
-            if self.selected_columns is None or col in self.selected_columns
+            col for col, ctype in hparams.target_column_types.items()
+            if ctype == 'real' and (self.selected_columns is None or col in self.selected_columns)
         ]
 
         self.use_positional_encoding = hparams.model_spec.use_positional_encoding
@@ -251,14 +259,15 @@ class TransformerModel(nn.Module):
                 hparams.model_spec.d_hid,
                 hparams.training_spec.dropout,
             )
+            self.transformer_encoder = TransformerEncoder(
+                encoder_layers, hparams.model_spec.nlayers, enable_nested_tensor=False
+            )
         else: 
             pass
             #encoder_layers = RegionAttention(
                 #self.
 
-        self.transformer_encoder = TransformerEncoder(
-            encoder_layers, hparams.model_spec.nlayers, enable_nested_tensor=False
-        )
+        
 
         # Cross attention setup
         if self.use_cross_attention:
@@ -271,7 +280,7 @@ class TransformerModel(nn.Module):
             self.W_V = nn.ModuleList([nn.Linear(self.d_col, self.d_col) for _ in range(self.R)])      # if per-region K
             
             # One MHA per region
-            self.region_attention_mods = nn.ModuleList([RegionAttention(d_embed=self.d_col, d_model=self.embedding_size, 
+            self.region_attention_mods = nn.ModuleList([RegionAttention(num_regions=self.R, d_embed=self.d_col, d_model=self.embedding_size, 
                     num_heads=self.R, dropout=self.drop) for _ in range(self.R)])
             
             # Project back to d_model
@@ -469,52 +478,19 @@ class TransformerModel(nn.Module):
 
             srcs.append(src_c)
 
+        src2 = self._recursive_concat(srcs) # (T, B, d_model) = (90, 2000, 64)
         if not self.use_cross_attention:
-            src2 = self._recursive_concat(srcs) # (T, B, d_model) = (90, 2000, 64)
             output = self.transformer_encoder(src2, self.src_mask) # (T, B, d_model) = (90, 2000, 64)
         
         else:
-            # TODO: Talk to Leon, figure out how to use hardware more efficiently, current B = 20 and ffn_hidden = ffn_in 
+            # currently just one layer with this implementation - TODO: wrap in a custom encoder!
             assert self.use_embedding, "Cross attention requires embedding to be used"
+            region_out = [self.region_attention_mods[i](src2, i) for i in range(self.R)]  # [R, B, T, d_model]
 
-            # Do within each multi head attention region - avoid weight sharing! 
-            Q = [self.W_Q[i](srcs[i]) for i in range(self.R)] # (self.R, B, T, d_model)
-            K = [self.W_K[j](srcs[j]) for j in range(self.R)] # (self.R, B, T, d_col)
-            V = [self.W_V[j](srcs[j]) for j in range(self.R)] # (self.R, B, T, d_col)
-
-            T, B = Q[0].shape[:2]  # T = sequence length, B = batch size
-
-            # Concatenate K and V across embedding dimension
-            K_all = torch.cat(K, dim=2)  # (B, T, d_model)
-            V_all = torch.cat(V, dim=2)  # (B, T, d_model)
-            """
-            # Pre-allocate tensor to hold all outputs
-            attn_outputs = torch.empty((T, B, self.R * self.embedding_size), device=self.device, dtype=torch.float32)
-
-            for i in range(self.R):
-                out_i = self.region_attention_mods[i](Q[i], K_all, V_all)  # [T, B, d_model]
-                attn_outputs[:, :, i * self.embedding_size : (i + 1) * self.embedding_size] = out_i
-
-            output = self.out_proj(attn_outputs)  # (T, B, d_model)
-            
-            """
-            attn_outputs_cpu = []
-
-            # modify transformer encoder to keep streams separate
-            for i in range(self.R):
-                out_i = self.region_attention_mods[i](Q[i], K_all, V_all)  # [T, B, d_model]
-                attn_outputs_cpu.append(out_i.cpu())  # Move to CPU immediately after computation
-
-            # Concatenate on CPU to avoid VRAM overload
-            attn_outputs = torch.cat(attn_outputs_cpu, dim=-1)  # [T, B, R * d_model]
-
-            # Move back to GPU only for final linear projection
-            attn_outputs = attn_outputs.to(self.device)
-
-            output = self.out_proj(attn_outputs)  # This projection is lightweight compared to FFN
+            output = self.out_proj(torch.cat(region_out, dim=2))  # Concatenate outputs and project to d_model - this should 
+            # only be after last layer to avoid mixing regions before that!
             
 
-         
         output = {
             target_column: self.decode(target_column, output)
             for target_column in self.target_columns
