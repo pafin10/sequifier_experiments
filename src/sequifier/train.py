@@ -111,41 +111,64 @@ def format_number(number: Union[int, float, np.float32]) -> str:
     number_adjusted = number * (10 ** (-order_of_magnitude))
     return f"{number_adjusted:5.2f}e{order_of_magnitude}"
 
-class RegionAttention(nn.Module):   
+class RegionAttention(nn.Module): 
     @beartype
-    def __init__(self, d_embed: int, d_model: int, num_heads: int, dropout: nn.Dropout):
+    def __init__(self, num_regions: int, d_embed: int, d_model: int, num_heads: int, dropout: nn.Dropout):
         super().__init__()
         self.d_embed = d_embed
         self.d_model = d_model
         self.nhead = num_heads
         self.drop = dropout
         self.d_head = d_model // num_heads
+        self.R = num_regions
         
         self.scale = math.sqrt(self.d_head)
-        self.out_proj = nn.Linear(d_model, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.ReLU(),
             nn.Linear(d_model, d_model),
             nn.Dropout(self.drop.p),
         )
+       
+        self.W_Q = nn.Linear(d_embed, self.d_model)  # Query projection
+        self.W_K = nn.Parameter(torch.empty(num_regions, num_regions, d_embed, self.d_head))
+        self.W_V = nn.Parameter(torch.empty(num_regions, num_regions, d_embed, self.d_head))
+
+        nn.init.xavier_uniform_(self.W_K)
+        nn.init.xavier_uniform_(self.W_V)
 
     
-    def forward(self, Q_i: Tensor, K_all: Tensor, V_all: Tensor) -> Tensor:
-        T, B = Q_i.shape[:2]  # T = sequence length, B = batch size
+    def forward(self, src_all: Tensor, q_region_index: int) -> Tensor: 
+        Q = self.W_Q(src_all[q_region_index])  # [B, T, d_model] - this is ok 
+        Q = Q.view(Q.shape[0], self.nhead, Q.shape[1], self.d_head)  # [B, H, T, d_head]
+        
+        Ks, Vs = [], []
+        for i in range(self.R):
+            K = src_all[i] @ self.W_K[q_region_index][i] 
+            V = src_all[i] @ self.W_V[q_region_index][i]  
+            Ks.append(K)
+            Vs.append(V)
+        
+        K = torch.stack(Ks, dim=1)  # [B, H, T, d_head]
+        V = torch.stack(Vs, dim=1)  # [B, H, T, d_head]
 
-        Q = Q_i.view(T, B, self.nhead, self.d_head)  # with d_head = d_model // num_heads
-        K = K_all.view(T, B, self.nhead, self.d_head)
-        V = V_all.view(T, B, self.nhead, self.d_head)
+        attn_scores = torch.einsum('bhtd, bhsd -> bhts', Q, K) / self.scale
 
-        # Compute attention 
-        attn_scores = torch.einsum("tbhd,sbhd->bhts", Q, K) / self.scale  # [B, H, T, S]
-        attn_weights = F.softmax(attn_scores, dim=-1)     # [B, H, T, S]
-        attn_out = torch.einsum("bhts,sbhd->tbhd", attn_weights, V)  # [T, B, H, d_head]
-        attn_out = attn_out.reshape(T, B, self.d_model)  # [T, B, d_model]
-        attn_out = self.drop(attn_out)
-        out = attn_out + self.ffn(attn_out)  # [ T, B, d_model ]
-        return out
+        attn_weights = F.softmax(attn_scores, dim=-1) # [B, H, T_q, T_k]
+        attn_out = torch.einsum('bhts, bhsd -> bhtd', attn_weights, V)  # [B, H, T_q, d_head]
+        B, _, T_q, _ = attn_out.shape
+
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, T_q, self.d_model)
+        attn_out = self.norm1(src_all[q_region_index] + attn_out)
+
+        # Feedforward + Residual + LayerNorm (region-wise FFN)
+        ffn_out = self.ffn(attn_out)
+        output = self.norm2(attn_out + ffn_out)
+
+        # Output shape: [B, T_q, d_model] → stays region-specific
+        return output  
 
 
 
@@ -221,13 +244,18 @@ class TransformerModel(nn.Module):
                 self.pos_encoder[col] = nn.Embedding(
                     self.seq_length, self.d_model_by_column[col]
                 )
+        if not self.use_cross_attention:
+            encoder_layers = TransformerEncoderLayer( # replace only class
+                self.embedding_size,
+                hparams.model_spec.nhead,
+                hparams.model_spec.d_hid,
+                hparams.training_spec.dropout,
+            )
+        else: 
+            pass
+            #encoder_layers = RegionAttention(
+                #self.
 
-        encoder_layers = TransformerEncoderLayer(
-            self.embedding_size,
-            hparams.model_spec.nhead,
-            hparams.model_spec.d_hid,
-            hparams.training_spec.dropout,
-        )
         self.transformer_encoder = TransformerEncoder(
             encoder_layers, hparams.model_spec.nlayers, enable_nested_tensor=False
         )
@@ -236,6 +264,7 @@ class TransformerModel(nn.Module):
         if self.use_cross_attention:
             self.R = len(self.real_columns)  # Number of regions
             self.d_col = self.d_model_by_column[self.real_columns[0]]  # Assuming all real columns have the same d_model_by_column
+            
             # Define separate linear layers for Q, K, V
             self.W_Q = nn.ModuleList([nn.Linear(self.d_col, self.embedding_size) for _ in range(self.R)])  # R = 16
             self.W_K = nn.ModuleList([nn.Linear(self.d_col, self.d_col) for _ in range(self.R)])      # if per-region K
@@ -448,6 +477,7 @@ class TransformerModel(nn.Module):
             # TODO: Talk to Leon, figure out how to use hardware more efficiently, current B = 20 and ffn_hidden = ffn_in 
             assert self.use_embedding, "Cross attention requires embedding to be used"
 
+            # Do within each multi head attention region - avoid weight sharing! 
             Q = [self.W_Q[i](srcs[i]) for i in range(self.R)] # (self.R, B, T, d_model)
             K = [self.W_K[j](srcs[j]) for j in range(self.R)] # (self.R, B, T, d_col)
             V = [self.W_V[j](srcs[j]) for j in range(self.R)] # (self.R, B, T, d_col)
@@ -470,6 +500,7 @@ class TransformerModel(nn.Module):
             """
             attn_outputs_cpu = []
 
+            # modify transformer encoder to keep streams separate
             for i in range(self.R):
                 out_i = self.region_attention_mods[i](Q[i], K_all, V_all)  # [T, B, d_model]
                 attn_outputs_cpu.append(out_i.cpu())  # Move to CPU immediately after computation
