@@ -17,6 +17,8 @@ from torch.nn import ModuleDict, TransformerEncoder, TransformerEncoderLayer
 from torch.nn.functional import one_hot
 import torch.nn.functional as F
 import torch.nn.init as init
+from torch.utils.checkpoint import checkpoint 
+
 
 torch._dynamo.config.suppress_errors = True
 from sequifier.config.train_config import load_train_config  # noqa: E402
@@ -124,16 +126,19 @@ class RegionAttention(nn.Module):
         
         self.scale = math.sqrt(self.d_head)
         self.residual_proj = nn.Linear(d_embed, d_model)  # Project residuals to d_model
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
+        self.norm1_gamma = nn.Parameter(torch.ones(d_model))
+        self.norm1_beta = nn.Parameter(torch.zeros(d_model))
+        self.norm2_gamma = nn.Parameter(torch.ones(d_model))
+        self.norm2_beta = nn.Parameter(torch.zeros(d_model))
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.ReLU(),
             nn.Linear(d_model, d_model),
             nn.Dropout(self.drop.p),
         )
-       
-        self.W_Q = nn.Linear(d_embed, self.d_model)  # Query projection
+        #######
+        self.W_Q = nn.Linear(d_embed, self.d_model)  # don't expand, compression is ok 
+        ######
         self.W_K = nn.Parameter(torch.empty(num_regions, num_regions, d_embed, self.d_head))
         self.W_V = nn.Parameter(torch.empty(num_regions, num_regions, d_embed, self.d_head))
 
@@ -152,9 +157,10 @@ class RegionAttention(nn.Module):
         Q = Q.view(Q.shape[0], self.nhead, Q.shape[1], self.d_head)  # [B, H, T, d_head]
         
         Ks, Vs = [], []
+        # TODO: just do all heads for Q, K, V within one module
         for i in range(self.R):
             start, end = i * self.d_embed, (i + 1) * self.d_embed
-            K = src_all[:, :, start:end] @ self.W_K[q_region_index][i] 
+            K = src_all[:, :, start:end] @ self.W_K[q_region_index][i] # double check backprop with indexing / slicing
             V = src_all[:, :, start:end] @ self.W_V[q_region_index][i]  
             Ks.append(K)
             Vs.append(V)
@@ -167,18 +173,95 @@ class RegionAttention(nn.Module):
         attn_weights = F.softmax(attn_scores, dim=-1) # [B, H, T_q, T_k]
         attn_out = torch.einsum('bhts, bhsd -> bhtd', attn_weights, V)  # [B, H, T_q, d_head]
         B, _, T_q, _ = attn_out.shape
-
+        
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T_q, self.d_model)
-        residual = self.residual_proj(src_all[:, :, start_idx:end_idx])
-        attn_out = self.norm1(residual + attn_out)
+        residual = src_all
+        #residual = self.residual_proj(src_all[:, :, start_idx:end_idx]) # 
+        
+        attn_out = F.layer_norm(
+            residual + attn_out, 
+            normalized_shape=(self.d_model, ), 
+            weight=self.norm1_gamma,
+            bias=self.norm1_beta,
+            eps=1e-5
+        )
+        
 
         # Feedforward + Residual + LayerNorm (region-wise FFN)
         ffn_out = self.ffn(attn_out)
-        output = self.norm2(attn_out + ffn_out)
-
+        
+        output = F.layer_norm(
+            attn_out + ffn_out, 
+            normalized_shape=(self.d_model,),
+            weight=self.norm2_gamma,
+            bias=self.norm2_beta,
+            eps=1e-5
+        )
+        
         # Output shape: [B, T_q, d_model] → stays region-specific
         return output  
 
+class RegionEncoder(nn.Module):
+    @beartype
+    def __init__(self, layers: nn.ModuleList, num_regions: int, d_model: int, d_col: int, drop: nn.Dropout, region_batch_size: int):
+        super().__init__()
+        self.layers = layers
+        self.num_regions = num_regions
+        self.d_model = d_model
+        self.d_col = d_col
+        self.drop = drop
+        self.region_batch_size = region_batch_size  # Process regions in micro-batches to avoid OOM
+
+        # Final projection back to d_model
+        self.out_proj = nn.Linear(self.d_model * self.num_regions, self.d_model)  
+
+    def forward(self, src: Tensor) -> Tensor:
+        """
+        Forward pass through the region encoder.
+        Args:
+            src: Tensor of shape [B, T, d_model] - input sequence data.
+        Returns:
+            Tensor of shape [B, T, d_model] - output sequence data after region-wise attention.
+        """
+       #src = src.view(B, T, self.num_regions, self.d_col).transpose0 (1, 2)  # [B, R, T, d_col]
+        #src = src.contiguous().view(B, self.num_regions * T, self.d_col)  # [B, R*T, d_col]
+
+        B, T, _ = src.shape
+
+        #TODO: Study below optimization, DEBUG
+        # out shape: (num_regions, B, T, d_model)
+
+        #NAIVE VERSION
+        out = [src for _ in range(self.num_regions)]
+        for layer in self.layers:
+            for i in range(self.num_regions):
+                out[i] = layer[i](out[i], i)
+        
+        out = src.unsqueeze(0).repeat(self.num_regions, 1, 1, 1)
+
+        # OPTIMIZED VERSION
+        """
+        for layer in self.layers:
+            # Process regions in micro-batches to avoid OOM
+            for start_idx in range(0, self.num_regions, self.region_batch_size):
+                end_idx = start_idx + self.region_batch_size
+                out_chunk = out[start_idx:end_idx]  # Shape: (region_batch_size, B, T, d_model)
+
+                # Process each region in the chunk
+                for region_offset, region_idx in enumerate(range(start_idx, end_idx)):
+
+                    region_input = out_chunk[region_offset].permute(1, 0, 2)  # (B, T, d_model)
+                    region_output = layer[region_idx](region_input, region_idx)  # Now shape is correct
+                    # Convert back to (T, B, d_model) if needed
+                    out_chunk[region_offset] = region_output
+
+                out[start_idx:end_idx] = out_chunk
+        """
+        
+        src = torch.stack(out, dim=1).transpose(1, 2)  # [B, T, R, d_model]
+        src = src.contiguous().view(B, T, self.num_regions * self.d_model)  # [B, T, d_model * R]
+        src = self.drop(src)  
+        return self.out_proj(src)  # Output shape: [B, T, d_model] - concatenated across regions
 
 
 class TransformerModel(nn.Module):
@@ -252,8 +335,20 @@ class TransformerModel(nn.Module):
                 self.pos_encoder[col] = nn.Embedding(
                     self.seq_length, self.d_model_by_column[col]
                 )
-        if not self.use_cross_attention:
-            encoder_layers = TransformerEncoderLayer( # replace only class
+        if self.use_cross_attention:
+            self.R = len(self.real_columns)  # Number of regions
+            self.d_col = self.d_model_by_column[self.real_columns[0]]  # Assuming all real columns have the same d_model_by_column
+            
+            # encoder
+            self.layers = nn.ModuleList(
+                nn.ModuleList([RegionAttention(num_regions=self.R, d_embed=self.d_col, d_model=self.embedding_size, 
+                    num_heads=self.R, dropout=self.drop) for _ in range(self.R)])
+                for _ in range(hparams.model_spec.nlayers)
+            )
+            self.region_encoder = RegionEncoder(self.layers, self.R, self.embedding_size, self.d_col, self.drop, 5)
+            
+        else: 
+            encoder_layers = TransformerEncoderLayer( 
                 self.embedding_size,
                 hparams.model_spec.nhead,
                 hparams.model_spec.d_hid,
@@ -262,30 +357,7 @@ class TransformerModel(nn.Module):
             self.transformer_encoder = TransformerEncoder(
                 encoder_layers, hparams.model_spec.nlayers, enable_nested_tensor=False
             )
-        else: 
-            pass
-            #encoder_layers = RegionAttention(
-                #self.
 
-        
-
-        # Cross attention setup
-        if self.use_cross_attention:
-            self.R = len(self.real_columns)  # Number of regions
-            self.d_col = self.d_model_by_column[self.real_columns[0]]  # Assuming all real columns have the same d_model_by_column
-            
-            # Define separate linear layers for Q, K, V
-            self.W_Q = nn.ModuleList([nn.Linear(self.d_col, self.embedding_size) for _ in range(self.R)])  # R = 16
-            self.W_K = nn.ModuleList([nn.Linear(self.d_col, self.d_col) for _ in range(self.R)])      # if per-region K
-            self.W_V = nn.ModuleList([nn.Linear(self.d_col, self.d_col) for _ in range(self.R)])      # if per-region K
-            
-            # One MHA per region
-            self.region_attention_mods = nn.ModuleList([RegionAttention(num_regions=self.R, d_embed=self.d_col, d_model=self.embedding_size, 
-                    num_heads=self.R, dropout=self.drop) for _ in range(self.R)])
-            
-            # Project back to d_model
-            self.out_proj = nn.Linear(self.embedding_size * self.R, self.embedding_size)  
-        
 
         self.decoder = ModuleDict()
         self.softmax = ModuleDict()
@@ -313,7 +385,7 @@ class TransformerModel(nn.Module):
             self.device
         )
 
-        self._init_weights() # Initialize weights - modify this function!
+        self._init_weights() # Initialize weights - rn he init
         self.optimizer = self._get_optimizer(
             **self._filter_key(hparams.training_spec.optimizer, "name")
         )
@@ -483,13 +555,8 @@ class TransformerModel(nn.Module):
             output = self.transformer_encoder(src2, self.src_mask) # (T, B, d_model) = (90, 2000, 64)
         
         else:
-            # currently just one layer with this implementation - TODO: wrap in a custom encoder!
             assert self.use_embedding, "Cross attention requires embedding to be used"
-            region_out = [self.region_attention_mods[i](src2, i) for i in range(self.R)]  # [R, B, T, d_model]
-
-            output = self.out_proj(torch.cat(region_out, dim=2))  # Concatenate outputs and project to d_model - this should 
-            # only be after last layer to avoid mixing regions before that!
-            
+            output = checkpoint(self.region_encoder, src2, use_reentrant=False)  # (T, B, d_model) = (90, 2000, 64)
 
         output = {
             target_column: self.decode(target_column, output)
