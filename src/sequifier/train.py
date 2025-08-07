@@ -137,8 +137,7 @@ class RegionAttention(nn.Module):
             nn.Dropout(self.drop.p),
         )
         #######
-        self.W_Q = nn.Linear(d_embed, self.d_model)  # don't expand, compression is ok 
-        ######
+        self.W_Q = nn.Parameter(torch.empty(num_regions, num_regions, d_embed, self.d_head))  # Query weights
         self.W_K = nn.Parameter(torch.empty(num_regions, num_regions, d_embed, self.d_head))
         self.W_V = nn.Parameter(torch.empty(num_regions, num_regions, d_embed, self.d_head))
 
@@ -146,82 +145,76 @@ class RegionAttention(nn.Module):
         nn.init.xavier_uniform_(self.W_V)
 
     
-    def forward(self, src_all: Tensor, q_region_index: int) -> Tensor: 
-        # src_all: [B, T, d_model] - all regions concatenated
+    def forward(self, src_all: Tensor) -> Tensor:
+        # src_all: [B, T, d_model] == [B, T, R * d_embed]
+        B, T, _ = src_all.shape
 
-        src_all = src_all.transpose(0, 1)  # [T, B, d_model] 
-        start_idx = q_region_index * self.d_embed
-        end_idx = (q_region_index + 1) * self.d_embed
-        
-        Q = self.W_Q(src_all[:, :, start_idx:end_idx]) # select correct slice for query region 
-        Q = Q.view(Q.shape[0], self.nhead, Q.shape[1], self.d_head)  # [B, H, T, d_head]
-        
-        Ks, Vs = [], []
-        # TODO: just do all heads for Q, K, V within one module
-        for i in range(self.R):
-            start, end = i * self.d_embed, (i + 1) * self.d_embed
-            K = src_all[:, :, start:end] @ self.W_K[q_region_index][i] # double check backprop with indexing / slicing
-            V = src_all[:, :, start:end] @ self.W_V[q_region_index][i]  
-            Ks.append(K)
-            Vs.append(V)
-        
-        K = torch.stack(Ks, dim=1)  # [B, H, T, d_head]
-        V = torch.stack(Vs, dim=1)  # [B, H, T, d_head]
+        # 1) reshape into explicit region blocks → [B, T, R, d_embed]
+        x = src_all.view(B, T, self.R, self.d_embed)
 
-        attn_scores = torch.einsum('bhtd, bhsd -> bhts', Q, K) / self.scale
+        # 2) compute Q, K, V for all region-pairs at once → [B, T, R, R, d_head]
+        Q = torch.einsum('btrd,qrde->btrqe', x, self.W_Q)
+        K = torch.einsum('btrd,qrde->btrqe', x, self.W_K)
+        V = torch.einsum('btrd,qrde->btrqe', x, self.W_V)
 
-        attn_weights = F.softmax(attn_scores, dim=-1) # [B, H, T_q, T_k]
-        attn_out = torch.einsum('bhts, bhsd -> bhtd', attn_weights, V)  # [B, H, T_q, d_head]
-        B, _, T_q, _ = attn_out.shape
-        
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, T_q, self.d_model)
+        # 3) collapse (R, R) into H = R*R heads and permute → [B, H, T, d_head]
+        H = self.R * self.R
+        Q = Q.reshape(B, T, H, self.d_head).permute(0, 2, 1, 3)
+        K = K.reshape(B, T, H, self.d_head).permute(0, 2, 1, 3)
+        V = V.reshape(B, T, H, self.d_head).permute(0, 2, 1, 3)
+
+        # 4) scaled-dot-product attention
+        attn_scores  = torch.einsum('bhtd,bhsd->bhts', Q, K) / self.scale
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_out     = torch.einsum('bhts,bhsd->bhtd', attn_weights, V)
+
+        # 5) concat heads → [B, T, d_model]
+        attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, T, H * self.d_head)
+
+        # 6) residual + LayerNorm
         residual = src_all
-        #residual = self.residual_proj(src_all[:, :, start_idx:end_idx]) # 
-        
         attn_out = F.layer_norm(
-            residual + attn_out, 
-            normalized_shape=(self.d_model, ), 
+            residual + attn_out,
+            normalized_shape=(self.d_model,),
             weight=self.norm1_gamma,
             bias=self.norm1_beta,
-            eps=1e-5
+            eps=1e-5,
         )
-        
 
-        # Feedforward + Residual + LayerNorm (region-wise FFN)
+        # 7) feed-forward + residual + LayerNorm
         ffn_out = self.ffn(attn_out)
-        
-        output = F.layer_norm(
-            attn_out + ffn_out, 
+        output  = F.layer_norm(
+            attn_out + ffn_out,
             normalized_shape=(self.d_model,),
             weight=self.norm2_gamma,
             bias=self.norm2_beta,
-            eps=1e-5
+            eps=1e-5,
         )
-        
-        # Output shape: [B, T_q, d_model] → stays region-specific
-        return output  
 
+        return output
+
+    
 class RegionEncoder(nn.Module):
     @beartype
-    def __init__(self, layers: nn.ModuleList, num_regions: int, d_model: int, d_col: int, drop: nn.Dropout, region_batch_size: int):
+    def __init__(self, layers: nn.ModuleList, num_regions: int, d_model: int, d_head: int, drop: nn.Dropout, region_batch_size: int):
         super().__init__()
         self.layers = layers
         self.num_regions = num_regions
         self.d_model = d_model
-        self.d_col = d_col
+        self.d_head = d_head
         self.drop = drop
         self.region_batch_size = region_batch_size  # Process regions in micro-batches to avoid OOM
 
         # Final projection back to d_model
-        self.out_proj = nn.Linear(self.d_model * self.num_regions, self.d_model)  
+        self.out_proj = nn.Linear(self.d_head * self.num_regions * self.num_regions, self.d_model)  
 
     def forward(self, src: Tensor) -> Tensor:
         """
         Forward pass through the region encoder.
         Args:
-            src: Tensor of shape [B, T, d_model] - input sequence data.
+            src: Tensor of shape [B, T, d_head * d_head] - input sequence data.
         Returns:
-            Tensor of shape [B, T, d_model] - output sequence data after region-wise attention.
+            Tensor of shape [B, T, d_head * d_head] - output sequence data after region-wise attention.
         """
        #src = src.view(B, T, self.num_regions, self.d_col).transpose0 (1, 2)  # [B, R, T, d_col]
         #src = src.contiguous().view(B, self.num_regions * T, self.d_col)  # [B, R*T, d_col]
@@ -232,13 +225,10 @@ class RegionEncoder(nn.Module):
         # out shape: (num_regions, B, T, d_model)
 
         #NAIVE VERSION
-        out = [src for _ in range(self.num_regions)]
-        for layer in self.layers:
-            for i in range(self.num_regions):
-                out[i] = layer[i](out[i], i)
+        out = src
+        for region_attn_mod in self.layers:
+            out = region_attn_mod(out)
         
-        out = src.unsqueeze(0).repeat(self.num_regions, 1, 1, 1)
-
         # OPTIMIZED VERSION
         """
         for layer in self.layers:
@@ -257,11 +247,10 @@ class RegionEncoder(nn.Module):
 
                 out[start_idx:end_idx] = out_chunk
         """
-        
-        src = torch.stack(out, dim=1).transpose(1, 2)  # [B, T, R, d_model]
-        src = src.contiguous().view(B, T, self.num_regions * self.d_model)  # [B, T, d_model * R]
-        src = self.drop(src)  
-        return self.out_proj(src)  # Output shape: [B, T, d_model] - concatenated across regions
+        #breakpoint()
+        out = out.contiguous().view(B, T, self.d_head * self.d_head)  # [B, T, d_head * d_head]
+        out = self.drop(out)  
+        return out
 
 
 class TransformerModel(nn.Module):
@@ -340,12 +329,20 @@ class TransformerModel(nn.Module):
             self.d_col = self.d_model_by_column[self.real_columns[0]]  # Assuming all real columns have the same d_model_by_column
             
             # encoder
-            self.layers = nn.ModuleList(
-                nn.ModuleList([RegionAttention(num_regions=self.R, d_embed=self.d_col, d_model=self.embedding_size, 
-                    num_heads=self.R, dropout=self.drop) for _ in range(self.R)])
+            self.layers = nn.ModuleList([
+                RegionAttention(
+                    num_regions=self.R, 
+                    d_model=self.embedding_size, 
+                    d_embed=self.d_col,
+                    num_heads=self.R * self.R, 
+                    dropout=self.drop
+                )
                 for _ in range(hparams.model_spec.nlayers)
-            )
-            self.region_encoder = RegionEncoder(self.layers, self.R, self.embedding_size, self.d_col, self.drop, 5)
+            ])
+
+            d_head = int(self.embedding_size / (self.R * self.R))  # d_embed is the size of each region's embedding
+            self.region_encoder = RegionEncoder(self.layers, self.R, self.embedding_size, d_head,
+                                                 self.drop, 5)
             
         else: 
             encoder_layers = TransformerEncoderLayer( 
@@ -556,7 +553,7 @@ class TransformerModel(nn.Module):
         
         else:
             assert self.use_embedding, "Cross attention requires embedding to be used"
-            output = checkpoint(self.region_encoder, src2, use_reentrant=False)  # (T, B, d_model) = (90, 2000, 64)
+            output = self.region_encoder(src2)  # (T, B, d_model) = (90, 2000, 64)
 
         output = {
             target_column: self.decode(target_column, output)
@@ -631,7 +628,6 @@ class TransformerModel(nn.Module):
         self.log_file.write("Training transformer complete")
         self.log_file.close()
 
-    @beartype
     def _train_epoch(
         self, X_train: dict[str, Tensor], y_train: dict[str, Tensor], epoch: int
     ) -> None:
@@ -641,23 +637,51 @@ class TransformerModel(nn.Module):
 
         num_batches = math.ceil(
             X_train[self.target_columns[0]].shape[0] / self.batch_size
-        )  # any column will do
+        )
         batch_order = torch.randperm(num_batches).tolist()
 
         for batch_count, batch in enumerate(batch_order):
             batch_start = int(batch * self.batch_size)
 
+            # --- prepare batch ---
             data, targets = self._get_batch(
                 X_train, y_train, batch_start, self.batch_size, to_device=True
             )
+
+            device = next(iter(data.values())).device
+
+            # 1) Before forward
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
+                before_fwd = torch.cuda.max_memory_allocated(device)
+                print(f"[Batch {batch_count}] before forward_train: {before_fwd/2**20:.1f} MiB")
+
+            # 2) Forward pass
             output = self.forward_train(data)
 
+            # 3) After forward
+            if device.type == "cuda":
+                after_fwd = torch.cuda.max_memory_allocated(device)
+                print(f"[Batch {batch_count}] after forward_train: {after_fwd/2**20:.1f} MiB")
+
+            # 4) Compute loss
             loss, losses = self._calculate_loss(output, targets)
 
+            # 5) Before backward
+            if device.type == "cuda":
+                before_bwd = torch.cuda.max_memory_allocated(device)
+                print(f"[Batch {batch_count}] before backward(): {before_bwd/2**20:.1f} MiB")
+
+            # 6) Backward pass
             loss.backward()
 
-            torch.nn.utils.clip_grad_norm_(self.parameters(), 0.5)
+            # 7) After backward
+            if device.type == "cuda":
+                after_bwd = torch.cuda.max_memory_allocated(device)
+                print(f"[Batch {batch_count}] after backward(): {after_bwd/2**20:.1f} MiB")
 
+            # 8) Gradient clipping and optimizer step
+            torch.nn.utils.clip_grad_norm_(self.parameters(), 0.5)
             if (
                 self.accumulation_steps is None
                 or (batch_count + 1) % self.accumulation_steps == 0
@@ -667,13 +691,15 @@ class TransformerModel(nn.Module):
                 self.optimizer.zero_grad()
 
             total_loss += loss.item()
+
+            # 9) Logging
             if (batch_count + 1) % self.log_interval == 0:
                 lr = self.scheduler.get_last_lr()[0]
                 s_per_batch = (time.time() - start_time) / self.log_interval
                 self.log_file.write(
                     f"| epoch {epoch:3d} | {(batch_count+1):5d}/{num_batches:5d} batches | "
                     f"lr {format_number(lr)} | s/batch {format_number(s_per_batch)} | "
-                    f"loss {format_number(total_loss)}"
+                    f"loss {format_number(total_loss)}\n"
                 )
                 total_loss = 0.0
                 start_time = time.time()
