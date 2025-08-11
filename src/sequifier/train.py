@@ -125,9 +125,8 @@ class TransformerModel(nn.Module):
             if self.selected_columns is None or col in self.selected_columns
         ]
         self.real_columns = [
-            col
-            for col in hparams.real_columns
-            if self.selected_columns is None or col in self.selected_columns
+            col for col, ctype in hparams.target_column_types.items()
+            if ctype == 'real' and (self.selected_columns is None or col in self.selected_columns)
         ]
 
         self.target_columns = hparams.target_columns
