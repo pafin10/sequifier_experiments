@@ -31,6 +31,22 @@ from sequifier.helpers import numpy_to_pytorch, subset_to_selected_columns  # no
 from sequifier.optimizers.optimizers import get_optimizer_class  # noqa: E402
 
 
+torch.autograd.set_detect_anomaly(True)   # pinpoints first op that creates NaN/Inf
+
+##### DEBUGGING FUNCTIONS #####
+def tensor_stats(x, name):
+    with torch.no_grad():
+        m = x.mean().item()
+        s = x.std().item()
+        n = x.norm().item()
+        print(f"{name:20s} mean={m:+.3e} std={s:.3e} norm={n:.3e}")
+
+def attn_entropy(weights, eps=1e-12):
+    # weights: [B, H, T, T]
+    p = weights.clamp_min(eps)
+    return (-(p * p.log()).sum(dim=-1).mean()).item()
+
+
 @beartype
 def train(args: Any, args_config: dict[str, Any]) -> None:
     """
@@ -115,6 +131,8 @@ def format_number(number: Union[int, float, np.float32]) -> str:
 
 class RegionAttention(nn.Module): 
     @beartype
+
+    #TODO: find what breaks backpropagation
     def __init__(self, num_regions: int, d_embed: int, d_model: int, num_heads: int, dropout: nn.Dropout):
         super().__init__()
         self.d_embed = d_embed
@@ -131,37 +149,36 @@ class RegionAttention(nn.Module):
         self.norm2_gamma = nn.Parameter(torch.ones(d_model))
         self.norm2_beta = nn.Parameter(torch.zeros(d_model))
         self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.ReLU(),
-            nn.Linear(d_model, d_model),
+            nn.Linear(d_model, 4 * d_model),
+            nn.GELU(),
+            nn.Linear(4 * d_model, d_model),
             nn.Dropout(self.drop.p),
         )
         #######
-        self.W_Q = nn.Linear(d_embed, self.d_model)  # don't expand, compression is ok 
-        ######
-        self.W_K = nn.Parameter(torch.empty(num_regions, num_regions, d_embed, self.d_head))
-        self.W_V = nn.Parameter(torch.empty(num_regions, num_regions, d_embed, self.d_head))
+        self.W_Q = nn.Parameter(torch.empty(num_regions, d_embed, self.d_head))  # don't expand, compression is ok 
+        self.W_K = nn.Parameter(torch.empty(num_regions, d_embed, self.d_head))
+        self.W_V = nn.Parameter(torch.empty(num_regions, d_embed, self.d_head))
 
+        nn.init.xavier_uniform_(self.W_Q)
         nn.init.xavier_uniform_(self.W_K)
         nn.init.xavier_uniform_(self.W_V)
 
     
     def forward(self, src_all: Tensor, q_region_index: int) -> Tensor: 
         # src_all: [B, T, d_model] - all regions concatenated
-
-        src_all = src_all.transpose(0, 1)  # [T, B, d_model] 
+        
         start_idx = q_region_index * self.d_embed
         end_idx = (q_region_index + 1) * self.d_embed
+        x_q = src_all[:, :, start_idx:end_idx]  # [T, B, d_embed]
         
-        Q = self.W_Q(src_all[:, :, start_idx:end_idx]) # select correct slice for query region 
-        Q = Q.view(Q.shape[0], self.nhead, Q.shape[1], self.d_head)  # [B, H, T, d_head]
-        
+        Qs = [x_q @ self.W_Q[i] for i in range(self.R)] # R different Qs, each with own weight matrix
+        Q = torch.stack(Qs, dim=1)                 # [B, H, T_q, d_head] - where H = R
+
         Ks, Vs = [], []
-        # TODO: just do all heads for Q, K, V within one module
         for i in range(self.R):
             start, end = i * self.d_embed, (i + 1) * self.d_embed
-            K = src_all[:, :, start:end] @ self.W_K[q_region_index][i] # double check backprop with indexing / slicing
-            V = src_all[:, :, start:end] @ self.W_V[q_region_index][i]  
+            K = src_all[:, :, start:end] @ self.W_K[i] # double check backprop with indexing / slicing
+            V = src_all[:, :, start:end] @ self.W_V[i]  
             Ks.append(K)
             Vs.append(V)
         
@@ -175,16 +192,18 @@ class RegionAttention(nn.Module):
         B, _, T_q, _ = attn_out.shape
         
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T_q, self.d_model)
-        residual = src_all
-        #residual = self.residual_proj(src_all[:, :, start_idx:end_idx]) # 
+        #residual = src_all
+        residual = self.residual_proj(src_all[:, :, start_idx:end_idx]) 
         
         attn_out = F.layer_norm(
-            residual + attn_out, 
+            residual + 
+            attn_out, 
             normalized_shape=(self.d_model, ), 
             weight=self.norm1_gamma,
             bias=self.norm1_beta,
             eps=1e-5
         )
+        
         
 
         # Feedforward + Residual + LayerNorm (region-wise FFN)
@@ -198,22 +217,24 @@ class RegionAttention(nn.Module):
             eps=1e-5
         )
         
+        
         # Output shape: [B, T_q, d_model] → stays region-specific
         return output  
 
 class RegionEncoder(nn.Module):
+    #TODO: Debug Encoder!!
     @beartype
-    def __init__(self, layers: nn.ModuleList, num_regions: int, d_model: int, d_col: int, drop: nn.Dropout, region_batch_size: int):
+    def __init__(self, layers: nn.ModuleList, num_regions: int, d_model: int, d_head: int, drop: nn.Dropout, region_batch_size: int):
         super().__init__()
         self.layers = layers
         self.num_regions = num_regions
         self.d_model = d_model
-        self.d_col = d_col
+        self.d_head = d_head
         self.drop = drop
         self.region_batch_size = region_batch_size  # Process regions in micro-batches to avoid OOM
 
         # Final projection back to d_model
-        self.out_proj = nn.Linear(self.d_model * self.num_regions, self.d_model)  
+        self.out_proj = nn.ModuleList([nn.Linear(self.d_model, self.d_head) for _ in range(self.num_regions)])
 
     def forward(self, src: Tensor) -> Tensor:
         """
@@ -223,45 +244,46 @@ class RegionEncoder(nn.Module):
         Returns:
             Tensor of shape [B, T, d_model] - output sequence data after region-wise attention.
         """
-       #src = src.view(B, T, self.num_regions, self.d_col).transpose0 (1, 2)  # [B, R, T, d_col]
-        #src = src.contiguous().view(B, self.num_regions * T, self.d_col)  # [B, R*T, d_col]
 
         B, T, _ = src.shape
 
-        #TODO: Study below optimization, DEBUG
-        # out shape: (num_regions, B, T, d_model)
+        #NAIVE VERSION - probably need to optimize
+        out_regions = [src.clone() for _ in range(self.num_regions)]  # each [B,T,d_model]
 
-        #NAIVE VERSION
-        out = [src for _ in range(self.num_regions)]
-        for layer in self.layers:
-            for i in range(self.num_regions):
-                out[i] = layer[i](out[i], i)
+        # 2) layer-wise, region-wise attention
+        for l, layer_list in enumerate(self.layers):                # for each transformer layer
+            next_out = []
+            for i, attn_module in enumerate(layer_list):  # for each region i
+                y_prev = out_regions[i]
+                y_i = attn_module(out_regions[i], q_region_index=i)
+                next_out.append(y_i)
+                """
+                with torch.no_grad():
+                    delta = (y_i - y_prev).norm().item()
+                    #print(f"[L{l} R{i}] Δout={delta:.3e}")
+
+                    # attn stats
+                    w = attn_module.debug.get('weights', None)
+                    if w is not None:
+                        H = attn_entropy(w)
+                        #print(f"[L{l} R{i}] attn_entropy={H:.3f} (higher==more diffuse)")
+
+                """
+                
+
+            out_regions = next_out
         
-        out = src.unsqueeze(0).repeat(self.num_regions, 1, 1, 1)
-
-        # OPTIMIZED VERSION
-        """
-        for layer in self.layers:
-            # Process regions in micro-batches to avoid OOM
-            for start_idx in range(0, self.num_regions, self.region_batch_size):
-                end_idx = start_idx + self.region_batch_size
-                out_chunk = out[start_idx:end_idx]  # Shape: (region_batch_size, B, T, d_model)
-
-                # Process each region in the chunk
-                for region_offset, region_idx in enumerate(range(start_idx, end_idx)):
-
-                    region_input = out_chunk[region_offset].permute(1, 0, 2)  # (B, T, d_model)
-                    region_output = layer[region_idx](region_input, region_idx)  # Now shape is correct
-                    # Convert back to (T, B, d_model) if needed
-                    out_chunk[region_offset] = region_output
-
-                out[start_idx:end_idx] = out_chunk
-        """
+        out = torch.stack(out_regions, dim=2)  # Shape: (B, T, R, d_model)
         
-        src = torch.stack(out, dim=1).transpose(1, 2)  # [B, T, R, d_model]
-        src = src.contiguous().view(B, T, self.num_regions * self.d_model)  # [B, T, d_model * R]
-        src = self.drop(src)  
-        return self.out_proj(src)  # Output shape: [B, T, d_model] - concatenated across regions
+        out = out.contiguous().view(B, T, self.num_regions * self.d_model)  # [B, T, d_model * R]
+        out = self.drop(out)  
+
+        projections = []
+        for i in range(self.num_regions):
+            projections.append(self.out_proj[i](out[:, :, i * self.d_model:(i + 1) * self.d_model]))  # Project each region's output
+        
+        out = torch.cat(projections, dim=2)  # Concatenate region outputs along the last dimension
+        return out  # Output shape: [B, T, d_model] - concatenated across regions
 
 
 class TransformerModel(nn.Module):
@@ -556,7 +578,8 @@ class TransformerModel(nn.Module):
         
         else:
             assert self.use_embedding, "Cross attention requires embedding to be used"
-            output = checkpoint(self.region_encoder, src2, use_reentrant=False)  # (T, B, d_model) = (90, 2000, 64)
+            src2 = src2.transpose(0, 1)  # (B, T, d_model) for region encoder
+            output = checkpoint(self.region_encoder, src2, use_reentrant=False)  
 
         output = {
             target_column: self.decode(target_column, output)
@@ -605,7 +628,10 @@ class TransformerModel(nn.Module):
                 and not np.isnan(total_loss)  # type: ignore # noqa: F821
             ):
                 epoch_start_time = time.time()
+                #self.overfit_one_batch(X_train, y_train, steps=1000, bs=8, lr=1e-3)  # Optional: Overfit one batch for debugging
                 self._train_epoch(X_train, y_train, epoch)
+                #self.train_on_subset(X_train, y_train, steps=2000, subset_batches=8, bs=32, lr=1e-2)  # Optional: Train on a subset for debugging
+                # TODO: training on subset, loss clearly decreases -> check why same setup doesnt work / generalize on full data
                 total_loss, total_losses, output = self._evaluate(X_valid, y_valid)
                 elapsed = time.time() - epoch_start_time
 
@@ -631,6 +657,92 @@ class TransformerModel(nn.Module):
         self.log_file.write("Training transformer complete")
         self.log_file.close()
 
+    def overfit_one_batch(self, X_train, y_train, steps=1000, bs=8, lr=1e-3):
+        self.train()
+        # optionally disable dropout for the test
+        try:
+            self.drop.p = 0.0
+        except Exception:
+            pass
+
+        # grab a fixed batch (no shuffling)
+        data, targets = self._get_batch(X_train, y_train, batch_start=0, batch_size=bs, to_device=True)
+
+        opt = torch.optim.AdamW(self.parameters(), lr=lr)
+        for i in range(steps):
+            opt.zero_grad(set_to_none=True)
+            output = self.forward_train(data)
+            loss, _ = self._calculate_loss(output, targets)
+            loss.backward()
+            opt.step()
+
+            if i % 50 == 0:
+                # optional: monitor grad norm
+                total_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), float('inf'))
+                print(f"{i:04d} | loss={loss.item():.6f} | grad_norm={total_norm:.3e}")
+
+    def _cache_subset(self, X, y, subset_batches: int, bs: int):
+        """Return two lists: [(data_i, target_i) ...], all on device."""
+        cached = []
+        for b in range(subset_batches):
+            data, targets = self._get_batch(X, y, b*bs, bs, to_device=True)
+            cached.append((data, targets))
+        return cached
+    
+    @torch.no_grad()
+    def _eval_subset_loss(self, cached_subset):
+        was_training = self.training
+        self.eval()
+        total = 0.0
+        n = 0
+        for data, targets in cached_subset:
+            out = self.forward_train(data)
+            loss, _ = self._calculate_loss(out, targets)
+            total += loss.item()
+            n += 1
+        if was_training:
+            self.train()
+        return total / max(n, 1)
+    
+    def train_on_subset(self, X, y, *, steps=4000, subset_batches=8, bs=32, lr=3e-3, eval_every=100):
+        self.train()
+        opt = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=0.0)
+        cached_subset = self._cache_subset(X, y, subset_batches, bs)
+
+        it = 0
+        running = None
+
+        for epoch_like in range(steps // max(subset_batches,1) + 1):
+            for b in range(subset_batches):
+                data, targets = cached_subset[b]   # fixed data each time
+
+                # one update
+                out = self.forward_train(data)
+                loss, _ = self._calculate_loss(out, targets)
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
+                opt.step()
+
+                it += 1
+                running = loss.item() if running is None else 0.9*running + 0.1*loss.item()
+
+                if it % eval_every == 0:
+                    overall = self._eval_subset_loss(cached_subset)
+                    # optional: grad norm for context
+                    gnorm = 0.0
+                    for p in self.parameters():
+                        if p.grad is not None:
+                            gnorm += p.grad.detach().norm().item()
+                    print(f"[subset] step {it:5d}  online_loss={running:.4f}  "
+                        f"overall_subset_loss={overall:.4f}  grad_norm={gnorm:.2e}")
+
+                if it >= steps:
+                    break
+            if it >= steps:
+                break
+
+
     @beartype
     def _train_epoch(
         self, X_train: dict[str, Tensor], y_train: dict[str, Tensor], epoch: int
@@ -654,8 +766,18 @@ class TransformerModel(nn.Module):
 
             loss, losses = self._calculate_loss(output, targets)
 
+            # before forward/backward
+            # snap = {n: p.detach().clone() for n,p in self.named_parameters() if p.requires_grad}
             loss.backward()
-
+            """
+            for l, layer_list in enumerate(self.region_encoder.layers):
+                for i, attn in enumerate(layer_list):
+                    g = 0.0
+                    for _, p in attn.named_parameters():
+                        if p.grad is not None:
+                            g += p.grad.detach().norm().item()
+                    #print(f"[L{l} R{i}] grad_sum_norm={g:.3e}")
+            """
             torch.nn.utils.clip_grad_norm_(self.parameters(), 0.5)
 
             if (
@@ -665,6 +787,13 @@ class TransformerModel(nn.Module):
             ):
                 self.optimizer.step()
                 self.optimizer.zero_grad()
+            """
+            for n,p in self.named_parameters():
+                if p.requires_grad:
+                    dn = (p.detach() - snap[n]).norm().item()
+                    pn = p.detach().norm().item()
+                    print(f"{n:40s} Δ||p||={dn:.3e}  ||p||={pn:.3e}")
+            """
 
             total_loss += loss.item()
             if (batch_count + 1) % self.log_interval == 0:
