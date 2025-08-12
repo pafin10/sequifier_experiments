@@ -131,95 +131,69 @@ def format_number(number: Union[int, float, np.float32]) -> str:
 
 class RegionAttention(nn.Module): 
     @beartype
-
-    #TODO: find what breaks backpropagation
     def __init__(self, num_regions: int, d_embed: int, d_model: int, num_heads: int, dropout: nn.Dropout):
         super().__init__()
         self.d_embed = d_embed
         self.d_model = d_model
         self.nhead = num_heads
         self.drop = dropout
-        self.d_head = d_model // num_heads
-        self.R = num_regions
+        self.d_head = d_model // num_heads # num_heads = num_regions in this case
+        self.num_regions = num_regions
         
         self.scale = math.sqrt(self.d_head)
         self.residual_proj = nn.Linear(d_embed, d_model)  # Project residuals to d_model
-        self.norm1_gamma = nn.Parameter(torch.ones(d_model))
-        self.norm1_beta = nn.Parameter(torch.zeros(d_model))
-        self.norm2_gamma = nn.Parameter(torch.ones(d_model))
-        self.norm2_beta = nn.Parameter(torch.zeros(d_model))
+        self.ln1 = nn.LayerNorm(d_model, eps=1e-5)
+        self.ln2 = nn.LayerNorm(d_model, eps=1e-5)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, 4 * d_model),
             nn.GELU(),
             nn.Linear(4 * d_model, d_model),
             nn.Dropout(self.drop.p),
-        )
+        ) # TODO: separate it out into regions, else we mix information again (for later layers)!
         #######
-        self.W_Q = nn.Parameter(torch.empty(num_regions, d_embed, self.d_head))  # don't expand, compression is ok 
-        self.W_K = nn.Parameter(torch.empty(num_regions, d_embed, self.d_head))
-        self.W_V = nn.Parameter(torch.empty(num_regions, d_embed, self.d_head))
+        self.W_Q = nn.Parameter(torch.empty(self.num_regions, self.d_embed, self.d_head))   
+        self.W_K = nn.Parameter(torch.empty(self.num_regions, self.d_embed, self.d_head))
+        self.W_V = nn.Parameter(torch.empty(self.num_regions, self.d_embed, self.d_head))
 
         nn.init.xavier_uniform_(self.W_Q)
         nn.init.xavier_uniform_(self.W_K)
         nn.init.xavier_uniform_(self.W_V)
 
     
-    def forward(self, src_all: Tensor, q_region_index: int) -> Tensor: 
-        # src_all: [B, T, d_model] - all regions concatenated
-        
-        start_idx = q_region_index * self.d_embed
-        end_idx = (q_region_index + 1) * self.d_embed
-        x_q = src_all[:, :, start_idx:end_idx]  # [T, B, d_embed]
-        
-        Qs = [x_q @ self.W_Q[i] for i in range(self.R)] # R different Qs, each with own weight matrix
-        Q = torch.stack(Qs, dim=1)                 # [B, H, T_q, d_head] - where H = R
-
+    def _mh_region_attn(self, x_q, src_all):
+        # x_q: [B,T,d_embed] for one query region; src_all: [B,T,R*d_embed] 
+        Qs = [x_q @ self.W_Q[i] for i in range(self.num_regions)]                # list of [B,T,d_head]
+        Q = torch.stack(Qs, dim=1)                                     # [B,H(=R),Tq,d_head]
         Ks, Vs = [], []
-        for i in range(self.R):
-            start, end = i * self.d_embed, (i + 1) * self.d_embed
-            K = src_all[:, :, start:end] @ self.W_K[i] # double check backprop with indexing / slicing
-            V = src_all[:, :, start:end] @ self.W_V[i]  
-            Ks.append(K)
-            Vs.append(V)
-        
-        K = torch.stack(Ks, dim=1)  # [B, H, T, d_head]
-        V = torch.stack(Vs, dim=1)  # [B, H, T, d_head]
 
-        attn_scores = torch.einsum('bhtd, bhsd -> bhts', Q, K) / self.scale
+        for i in range(self.num_regions):
+            s, e = i*self.d_embed, (i+1)*self.d_embed
+            Xi = src_all[:, :, s:e]                                    # [B,T,d_embed]
+            Ks.append(Xi @ self.W_K[i]);  Vs.append(Xi @ self.W_V[i])
+        
+        K = torch.stack(Ks, dim=1)                                     # [B,H,Tk,d_head]
+        V = torch.stack(Vs, dim=1)                                     # [B,H,Tk,d_head]
 
-        attn_weights = F.softmax(attn_scores, dim=-1) # [B, H, T_q, T_k]
-        attn_out = torch.einsum('bhts, bhsd -> bhtd', attn_weights, V)  # [B, H, T_q, d_head]
-        B, _, T_q, _ = attn_out.shape
-        
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, T_q, self.d_model)
-        #residual = src_all
-        residual = self.residual_proj(src_all[:, :, start_idx:end_idx]) 
-        
-        attn_out = F.layer_norm(
-            residual + 
-            attn_out, 
-            normalized_shape=(self.d_model, ), 
-            weight=self.norm1_gamma,
-            bias=self.norm1_beta,
-            eps=1e-5
-        )
-        
-        
+        attn_scores = torch.einsum('bhtd,bhsd->bhts', Q, K) / self.scale
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_weights = self.drop(attn_weights)
+        attn_out = torch.einsum('bhts,bhsd->bhtd', attn_weights, V)    # [B,H,Tq,d_head]
+        B, H, Tq, Dh = attn_out.shape
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, Tq, H*Dh)  # [B,Tq,d_model]
+        return attn_out
 
-        # Feedforward + Residual + LayerNorm (region-wise FFN)
-        ffn_out = self.ffn(attn_out)
-        
-        output = F.layer_norm(
-            attn_out + ffn_out, 
-            normalized_shape=(self.d_model,),
-            weight=self.norm2_gamma,
-            bias=self.norm2_beta,
-            eps=1e-5
-        )
-        
-        
-        # Output shape: [B, T_q, d_model] → stays region-specific
-        return output  
+    def forward(self, src_all, q_region_index):
+        # src_all = self.ln1(src_all)  # LayerNorm on the entire input sequence
+        s, e = q_region_index*self.d_embed, (q_region_index+1)*self.d_embed
+        x_q = src_all[:, :, s:e] # [B,T,d_embed]
+
+        # Pre-LN attention block - could do residual inside of attention module instead (avoid expansion)
+        y = self.residual_proj(x_q) + self._mh_region_attn(x_q, src_all)             
+        # Pre-LN FFN block
+        # This is fine for the first layer but afterwards a joint ffn leads to region mixing and no clear region pair 
+        # interpretation of attention weights
+        out = y + self.ffn(self.ln2(y))                                 
+        return out
 
 class RegionEncoder(nn.Module):
     #TODO: Debug Encoder!!
@@ -231,7 +205,6 @@ class RegionEncoder(nn.Module):
         self.d_model = d_model
         self.d_head = d_head
         self.drop = drop
-        self.region_batch_size = region_batch_size  # Process regions in micro-batches to avoid OOM
 
         # Final projection back to d_model
         self.out_proj = nn.ModuleList([nn.Linear(self.d_model, self.d_head) for _ in range(self.num_regions)])
@@ -247,14 +220,14 @@ class RegionEncoder(nn.Module):
 
         B, T, _ = src.shape
 
-        #NAIVE VERSION - probably need to optimize
+        # 1) Prepare input for each region
         out_regions = [src.clone() for _ in range(self.num_regions)]  # each [B,T,d_model]
 
         # 2) layer-wise, region-wise attention
         for l, layer_list in enumerate(self.layers):                # for each transformer layer
             next_out = []
             for i, attn_module in enumerate(layer_list):  # for each region i
-                y_prev = out_regions[i]
+                #y_prev = out_regions[i]
                 y_i = attn_module(out_regions[i], q_region_index=i)
                 next_out.append(y_i)
                 """
@@ -274,15 +247,15 @@ class RegionEncoder(nn.Module):
             out_regions = next_out
         
         out = torch.stack(out_regions, dim=2)  # Shape: (B, T, R, d_model)
-        
+
         out = out.contiguous().view(B, T, self.num_regions * self.d_model)  # [B, T, d_model * R]
         out = self.drop(out)  
 
         projections = []
         for i in range(self.num_regions):
             projections.append(self.out_proj[i](out[:, :, i * self.d_model:(i + 1) * self.d_model]))  # Project each region's output
-        
-        out = torch.cat(projections, dim=2)  # Concatenate region outputs along the last dimension
+        # ffn
+        out = torch.cat(projections, dim=2)  
         return out  # Output shape: [B, T, d_model] - concatenated across regions
 
 
@@ -411,6 +384,11 @@ class TransformerModel(nn.Module):
         self.optimizer = self._get_optimizer(
             **self._filter_key(hparams.training_spec.optimizer, "name")
         )
+        #### EDIT #####
+        for g in self.optimizer.param_groups:
+            g["weight_decay"] = 0.0
+        ###############
+        
         self.scheduler = self._get_scheduler(
             **self._filter_key(hparams.training_spec.scheduler, "name")
         )
@@ -628,8 +606,8 @@ class TransformerModel(nn.Module):
                 and not np.isnan(total_loss)  # type: ignore # noqa: F821
             ):
                 epoch_start_time = time.time()
-                #self.overfit_one_batch(X_train, y_train, steps=1000, bs=8, lr=1e-3)  # Optional: Overfit one batch for debugging
-                self._train_epoch(X_train, y_train, epoch)
+                #self.overfit_one_batch(X_train, y_train, steps=4000, bs=16, lr=1e-2)  # Optional: Overfit one batch for debugging
+                train_loss = self._train_epoch(X_train, y_train, epoch)
                 #self.train_on_subset(X_train, y_train, steps=2000, subset_batches=8, bs=32, lr=1e-2)  # Optional: Train on a subset for debugging
                 # TODO: training on subset, loss clearly decreases -> check why same setup doesnt work / generalize on full data
                 total_loss, total_losses, output = self._evaluate(X_valid, y_valid)
@@ -648,7 +626,7 @@ class TransformerModel(nn.Module):
 
                 self.scheduler.step()
                 if epoch % self.iter_save == 0:
-                    self._save(epoch, total_loss)
+                    self._save(epoch, total_loss, train_loss)
 
                 last_epoch = epoch
 
@@ -706,7 +684,9 @@ class TransformerModel(nn.Module):
     
     def train_on_subset(self, X, y, *, steps=4000, subset_batches=8, bs=32, lr=3e-3, eval_every=100):
         self.train()
-        opt = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=0.0)
+        #opt = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=0.0)
+        opt = self.optimizer
+        breakpoint()
         cached_subset = self._cache_subset(X, y, subset_batches, bs)
 
         it = 0
@@ -746,14 +726,20 @@ class TransformerModel(nn.Module):
     @beartype
     def _train_epoch(
         self, X_train: dict[str, Tensor], y_train: dict[str, Tensor], epoch: int
-    ) -> None:
-        self.train()  # turn on train mode
-        total_loss = 0.0
+    ) -> None | np.float32:
+        self.train()  # train mode ON
+
+        # --- logging window (unchanged semantics: sum within window) ---
+        log_loss_sum = 0.0
         start_time = time.time()
+
+        # --- epoch bookkeeping (NEW: proper average over the epoch) ---
+        epoch_loss_sum = 0.0
+        epoch_loss_count = 0
 
         num_batches = math.ceil(
             X_train[self.target_columns[0]].shape[0] / self.batch_size
-        )  # any column will do
+        )
         batch_order = torch.randperm(num_batches).tolist()
 
         for batch_count, batch in enumerate(batch_order):
@@ -764,21 +750,12 @@ class TransformerModel(nn.Module):
             )
             output = self.forward_train(data)
 
+            # loss should already reflect your intended reduction/masking
             loss, losses = self._calculate_loss(output, targets)
 
-            # before forward/backward
-            # snap = {n: p.detach().clone() for n,p in self.named_parameters() if p.requires_grad}
+            # keep training dynamics IDENTICAL: do NOT rescale by accumulation_steps here
             loss.backward()
-            """
-            for l, layer_list in enumerate(self.region_encoder.layers):
-                for i, attn in enumerate(layer_list):
-                    g = 0.0
-                    for _, p in attn.named_parameters():
-                        if p.grad is not None:
-                            g += p.grad.detach().norm().item()
-                    #print(f"[L{l} R{i}] grad_sum_norm={g:.3e}")
-            """
-            torch.nn.utils.clip_grad_norm_(self.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
 
             if (
                 self.accumulation_steps is None
@@ -787,25 +764,28 @@ class TransformerModel(nn.Module):
             ):
                 self.optimizer.step()
                 self.optimizer.zero_grad()
-            """
-            for n,p in self.named_parameters():
-                if p.requires_grad:
-                    dn = (p.detach() - snap[n]).norm().item()
-                    pn = p.detach().norm().item()
-                    print(f"{n:40s} Δ||p||={dn:.3e}  ||p||={pn:.3e}")
-            """
 
-            total_loss += loss.item()
+            # --- bookkeeping ---
+            val = float(loss.item())
+            log_loss_sum += val
+            epoch_loss_sum += val
+            epoch_loss_count += 1
+
             if (batch_count + 1) % self.log_interval == 0:
                 lr = self.scheduler.get_last_lr()[0]
                 s_per_batch = (time.time() - start_time) / self.log_interval
+                # keep message format; still report the (window) sum like before
                 self.log_file.write(
                     f"| epoch {epoch:3d} | {(batch_count+1):5d}/{num_batches:5d} batches | "
                     f"lr {format_number(lr)} | s/batch {format_number(s_per_batch)} | "
-                    f"loss {format_number(total_loss)}"
+                    f"loss {format_number(log_loss_sum)}\n"
                 )
-                total_loss = 0.0
+                log_loss_sum = 0.0
                 start_time = time.time()
+
+        # --- return proper epoch-average training loss (NEW) ---
+        epoch_avg_loss = epoch_loss_sum / max(1, epoch_loss_count)
+        return np.float32(epoch_avg_loss)
 
     @beartype
     def _calculate_loss(
@@ -1018,7 +998,7 @@ class TransformerModel(nn.Module):
             )
 
     @beartype
-    def _save(self, epoch: int, val_loss: np.float32) -> None:
+    def _save(self, epoch: int, val_loss: np.float32, train_loss: np.float32) -> None:
         os.makedirs(os.path.join(self.project_path, "checkpoints"), exist_ok=True)
 
         output_path = os.path.join(
@@ -1036,6 +1016,20 @@ class TransformerModel(nn.Module):
             },
             output_path,
         )
+        if train_loss is not None:
+            output_path = os.path.join(
+                self.project_path,
+                "checkpoints",
+                f"{self.model_name}-train-epoch-{epoch}.pt",
+            )
+            torch.save(
+                {   
+                    "epoch": epoch,
+                    "loss": train_loss
+                },
+                output_path,
+            )
+
         self.log_file.write(f"Saved model to {output_path}")
 
     @beartype
