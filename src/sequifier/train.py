@@ -18,6 +18,7 @@ from torch.nn.functional import one_hot
 import torch.nn.functional as F
 import torch.nn.init as init
 from torch.utils.checkpoint import checkpoint 
+from typing import Optional, Tuple, List
 
 
 torch._dynamo.config.suppress_errors = True
@@ -131,133 +132,169 @@ def format_number(number: Union[int, float, np.float32]) -> str:
 
 class RegionAttention(nn.Module): 
     @beartype
-    def __init__(self, num_regions: int, d_embed: int, d_model: int, num_heads: int, dropout: nn.Dropout):
+    def __init__(self, num_regions, d_embed, d_head, dropout=0.0):
         super().__init__()
-        self.d_embed = d_embed
-        self.d_model = d_model
-        self.nhead = num_heads
-        self.drop = dropout
-        self.d_head = d_model // num_heads # num_heads = num_regions in this case
-        self.num_regions = num_regions
-        
-        self.scale = math.sqrt(self.d_head)
-        self.residual_proj = nn.Linear(d_embed, d_model)  # Project residuals to d_model
-        self.ln1 = nn.LayerNorm(d_model, eps=1e-5)
-        self.ln2 = nn.LayerNorm(d_model, eps=1e-5)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, 4 * d_model),
-            nn.GELU(),
-            nn.Linear(4 * d_model, d_model),
-            nn.Dropout(self.drop.p),
-        ) # TODO: separate it out into regions, else we mix information again (for later layers)!
-        #######
-        self.W_Q = nn.Parameter(torch.empty(self.num_regions, self.d_embed, self.d_head))   
-        self.W_K = nn.Parameter(torch.empty(self.num_regions, self.d_embed, self.d_head))
-        self.W_V = nn.Parameter(torch.empty(self.num_regions, self.d_embed, self.d_head))
+        self.R = num_regions
+        self.De = d_embed
+        self.Dh = d_head
+        self.scale = math.sqrt(d_head)
+        self.drop = nn.Dropout(dropout)
 
-        nn.init.xavier_uniform_(self.W_Q)
-        nn.init.xavier_uniform_(self.W_K)
-        nn.init.xavier_uniform_(self.W_V)
+        # region-specific projections: [R, De, Dh]
+        self.W_Q = nn.Parameter(torch.empty(self.R, self.De, self.Dh))
+        self.W_K = nn.Parameter(torch.empty(self.R, self.De, self.Dh))
+        self.W_V = nn.Parameter(torch.empty(self.R, self.De, self.Dh))
+        for w in (self.W_Q, self.W_K, self.W_V):
+            nn.init.xavier_uniform_(w)
 
+    def _mean_pairwise_map(self, attn):  # attn: [B,R,R,Tq,Tk]
+        # For logging/plotting: average over time dims and batch -> [R,R]
+        return attn.mean(dim=(0, 3, 4))
     
-    def _mh_region_attn(self, x_q, src_all):
-        # x_q: [B,T,d_embed] for one query region; src_all: [B,T,R*d_embed] 
-        Qs = [x_q @ self.W_Q[i] for i in range(self.num_regions)]                # list of [B,T,d_head]
-        Q = torch.stack(Qs, dim=1)                                     # [B,H(=R),Tq,d_head]
-        Ks, Vs = [], []
+    @beartype
+    def forward(self, src_all, return_maps=False):
+        """
+        src_all: [B, T, R*De]
+        returns: y: [B, T, R*Dh], (optional) attn_maps: [R, R] averaged
+        """
+        B, T, _ = src_all.shape
+        x = src_all.view(B, T, self.R, self.De)                 # [B,T,R,De]
 
-        for i in range(self.num_regions):
-            s, e = i*self.d_embed, (i+1)*self.d_embed
-            Xi = src_all[:, :, s:e]                                    # [B,T,d_embed]
-            Ks.append(Xi @ self.W_K[i]);  Vs.append(Xi @ self.W_V[i])
-        
-        K = torch.stack(Ks, dim=1)                                     # [B,H,Tk,d_head]
-        V = torch.stack(Vs, dim=1)                                     # [B,H,Tk,d_head]
+        # Q,K,V: [B,R,T,Dh]
+        Q = torch.einsum('btrd,rdh->brth', x, self.W_Q)
+        K = torch.einsum('btrd,rdh->brth', x, self.W_K)
+        V = torch.einsum('btrd,rdh->brth', x, self.W_V)
 
-        attn_scores = torch.einsum('bhtd,bhsd->bhts', Q, K) / self.scale
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_weights = self.drop(attn_weights)
-        attn_out = torch.einsum('bhts,bhsd->bhtd', attn_weights, V)    # [B,H,Tq,d_head]
-        B, H, Tq, Dh = attn_out.shape
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, Tq, H*Dh)  # [B,Tq,d_model]
-        return attn_out
+        # Pairwise scores: [B, R(i), R(j), Tq, Tk]
+        scores = torch.einsum('brth,bjuh->brjtu', Q, K) / self.scale
 
-    def forward(self, src_all, q_region_index):
-        # src_all = self.ln1(src_all)  # LayerNorm on the entire input sequence
-        s, e = q_region_index*self.d_embed, (q_region_index+1)*self.d_embed
-        x_q = src_all[:, :, s:e] # [B,T,d_embed]
+        # Softmax over (j, Tk) for each (b,i,tq)
+        scores_flat = scores.permute(0,1,3,2,4).contiguous()          # [B,R,Tq,R,Tk]
+        scores_flat = scores_flat.view(B, self.R, T, self.R*T)        # [B,R,Tq,R*Tk]
+        attn = F.softmax(scores_flat, dim=-1)
+        attn = self.drop(attn)
+        attn = attn.view(B, self.R, T, self.R, T)                     # [B,R,Tq,R,Tk]
 
-        # Pre-LN attention block - could do residual inside of attention module instead (avoid expansion)
-        y = self.residual_proj(x_q) + self._mh_region_attn(x_q, src_all)             
-        # Pre-LN FFN block
-        # This is fine for the first layer but afterwards a joint ffn leads to region mixing and no clear region pair 
-        # interpretation of attention weights
-        out = y + self.ffn(self.ln2(y))                                 
-        return out
+        # Aggregate values over (j, Tk): out_r = [B,R,T,Dh]
+        out_r = torch.einsum('brtju,bjuh->brth', attn, V)
+
+        # Concat regions → [B,T,R*Dh]
+        y = out_r.permute(0,2,1,3).contiguous().view(B, T, self.R*self.Dh)
+
+        if return_maps:
+            return y, self._mean_pairwise_map(attn)  # [R,R]
+        return y
+
+
+class RegionEncoderLayer(nn.Module):
+    def __init__(self, R, d_embed, d_head, d_model=None, dropout=0.1, ffn_mult=4):
+        super().__init__()
+        self.R, self.Dh = R, d_head
+        self.d_model = d_model if d_model is not None else R * d_head  # keep width compact
+        self.in_proj  = nn.Linear(R * d_embed, self.d_model)           # match residual size
+        self.attn = RegionAttention(R, d_embed, d_head, dropout)
+        self.ln1 = nn.LayerNorm(self.d_model, eps=1e-5)
+        self.ffn = nn.Sequential(
+            nn.Linear(self.d_model, ffn_mult*self.d_model),
+            nn.GELU(),
+            nn.Linear(ffn_mult*self.d_model, self.d_model),
+            nn.Dropout(dropout),
+        )
+        self.ln2 = nn.LayerNorm(self.d_model, eps=1e-5)
+
+    def forward(self, x, return_maps=False):
+        """
+        x: [B,T,R*De]  ->  y: [B,T,d_model]
+        """
+        # Pre-LN transformer style
+        y_attn, maps = self.attn(self.ln1(self.in_proj(x)), return_maps=True)
+        y = self.in_proj(x) + y_attn                            # residual
+        y = y + self.ffn(self.ln2(y))                           # FFN + residual
+
+        if return_maps:
+            return y, maps                                      # maps: [R,R] mean over time/batch
+        return y
 
 class RegionEncoder(nn.Module):
-    #TODO: Debug Encoder!!
     @beartype
-    def __init__(self, layers: nn.ModuleList, num_regions: int, d_model: int, d_head: int, drop: nn.Dropout, region_batch_size: int):
+    def __init__(
+        self,
+        num_regions: int,
+        d_embed_in: int,              # per-region dim of the raw input
+        d_head: int,                  # per-region hidden dim used inside the stack
+        num_layers: int,
+        d_model: Optional[int] = None,
+        dropout: float = 0.1,
+        ffn_mult: int = 4,
+        project_in: bool = True,      # project per-region d_embed_in -> d_head at the front if needed
+        project_out: bool = False     # optionally project back to d_embed_in at the end
+    ):
         super().__init__()
-        self.layers = layers
-        self.num_regions = num_regions
-        self.d_model = d_model
-        self.d_head = d_head
-        self.drop = drop
+        self.R = num_regions
+        self.De_in = d_embed_in
+        self.Dh = d_head
+        self.d_model = (num_regions * d_head) if d_model is None else d_model
+        assert self.d_model == self.R * self.Dh, \
+            "For simplest wiring, set d_model == num_regions * d_head."
 
-        # Final projection back to d_model
-        self.out_proj = nn.ModuleList([nn.Linear(self.d_model, self.d_head) for _ in range(self.num_regions)])
+        # --- optional per-region in-proj: [B,T,R*De_in] -> [B,T,R*Dh]
+        self.use_in_proj = project_in and (self.De_in != self.Dh)
+        if self.use_in_proj:
+            self.in_proj_r = nn.Linear(self.De_in, self.Dh)  # applied per region
+        else:
+            self.in_proj_r = nn.Identity()
 
-    def forward(self, src: Tensor) -> Tensor:
-        """
-        Forward pass through the region encoder.
-        Args:
-            src: Tensor of shape [B, T, d_model] - input sequence data.
-        Returns:
-            Tensor of shape [B, T, d_model] - output sequence data after region-wise attention.
-        """
+        # --- the stack (every layer consumes/produces [B,T,R*Dh])
+        self.layers = nn.ModuleList([
+            RegionEncoderLayer(
+                R=self.R,
+                d_embed=self.Dh,     # internal per-region width
+                d_head=self.Dh,      # Q/K/V map Dh -> Dh (simplest/fastest)
+                d_model=self.d_model,
+                dropout=dropout,
+                ffn_mult=ffn_mult,
+            )
+            for _ in range(num_layers)
+        ])
 
-        B, T, _ = src.shape
+        # --- optional per-region out-proj back to the original per-region width
+        self.use_out_proj = project_out and (self.De_in != self.Dh)
+        if self.use_out_proj:
+            self.out_proj_r = nn.Linear(self.Dh, self.De_in)
+        else:
+            self.out_proj_r = nn.Identity()
 
-        # 1) Prepare input for each region
-        out_regions = [src.clone() for _ in range(self.num_regions)]  # each [B,T,d_model]
+    def _per_region_apply(self, x: torch.Tensor, linear: nn.Module) -> torch.Tensor:
+        # x: [B,T,R*D]; apply the same Linear to the last dim in a block-diagonal way
+        B, T, _ = x.shape
+        x = x.view(B, T, self.R, -1)   # [B,T,R,D]
+        x = linear(x)                  # broadcasting over B,T,R; Linear applies on last dim
+        return x.view(B, T, self.R * x.shape[-1])
 
-        # 2) layer-wise, region-wise attention
-        for l, layer_list in enumerate(self.layers):                # for each transformer layer
-            next_out = []
-            for i, attn_module in enumerate(layer_list):  # for each region i
-                #y_prev = out_regions[i]
-                y_i = attn_module(out_regions[i], q_region_index=i)
-                next_out.append(y_i)
-                """
-                with torch.no_grad():
-                    delta = (y_i - y_prev).norm().item()
-                    #print(f"[L{l} R{i}] Δout={delta:.3e}")
+    def forward(
+        self,
+        src: torch.Tensor,                       # [B,T,R*De_in]
+        return_maps: bool = False
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
+        # front per-region projection if needed
+        x = self._per_region_apply(src, self.in_proj_r) if self.use_in_proj else src  # [B,T,R*Dh]
 
-                    # attn stats
-                    w = attn_module.debug.get('weights', None)
-                    if w is not None:
-                        H = attn_entropy(w)
-                        #print(f"[L{l} R{i}] attn_entropy={H:.3f} (higher==more diffuse)")
+        layer_maps: List[torch.Tensor] = []
+        for layer in self.layers:
+            if return_maps:
+                x, m = layer(x, return_maps=True)   # x: [B,T,R*Dh], m: [R,R] mean over time/batch
+                layer_maps.append(m)
+            else:
+                x = layer(x)
 
-                """
-                
+        # optional back-projection to original per-region width
+        if self.use_out_proj:
+            x = self._per_region_apply(x, self.out_proj_r)  # [B,T,R*De_in]
 
-            out_regions = next_out
-        
-        out = torch.stack(out_regions, dim=2)  # Shape: (B, T, R, d_model)
-
-        out = out.contiguous().view(B, T, self.num_regions * self.d_model)  # [B, T, d_model * R]
-        out = self.drop(out)  
-
-        projections = []
-        for i in range(self.num_regions):
-            projections.append(self.out_proj[i](out[:, :, i * self.d_model:(i + 1) * self.d_model]))  # Project each region's output
-        # ffn
-        out = torch.cat(projections, dim=2)  
-        return out  # Output shape: [B, T, d_model] - concatenated across regions
-
+        if return_maps:
+            # stack to [L, R, R] (layers, query_region, key_region)
+            return x, torch.stack(layer_maps, dim=0)
+        return x
 
 class TransformerModel(nn.Module):
     @beartype
@@ -335,12 +372,9 @@ class TransformerModel(nn.Module):
             self.d_col = self.d_model_by_column[self.real_columns[0]]  # Assuming all real columns have the same d_model_by_column
             
             # encoder
-            self.layers = nn.ModuleList(
-                nn.ModuleList([RegionAttention(num_regions=self.R, d_embed=self.d_col, d_model=self.embedding_size, 
-                    num_heads=self.R, dropout=self.drop) for _ in range(self.R)])
-                for _ in range(hparams.model_spec.nlayers)
-            )
-            self.region_encoder = RegionEncoder(self.layers, self.R, self.embedding_size, self.d_col, self.drop, 5)
+            self.region_encoder = RegionEncoder(num_regions=self.R, d_embed_in=self.d_col, d_head=self.embedding_size // self.R,
+                                                num_layers=hparams.model_spec.nlayers, d_model=self.embedding_size, dropout=hparams.training_spec.dropout,
+                                                )
             
         else: 
             encoder_layers = TransformerEncoderLayer( 
