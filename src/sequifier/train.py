@@ -129,6 +129,35 @@ def format_number(number: Union[int, float, np.float32]) -> str:
     number_adjusted = number * (10 ** (-order_of_magnitude))
     return f"{number_adjusted:5.2f}e{order_of_magnitude}"
 
+
+class GroupedFFN(nn.Module):
+    @beartype
+    def __init__(self, R, Dh, mult=4, dropout=0.0, shared=True):
+        super().__init__()
+        self.R, self.Dh, self.shared = R, Dh, shared
+        self.ln = nn.LayerNorm(Dh)
+        self.drop = dropout
+        if shared:
+            self.ff1 = nn.Linear(Dh, mult*Dh)
+            self.ff2 = nn.Linear(mult*Dh, Dh)
+        else:
+            self.ff1 = nn.ModuleList([nn.Linear(Dh, mult*Dh) for _ in range(R)])
+            self.ff2 = nn.ModuleList([nn.Linear(mult*Dh, Dh) for _ in range(R)])
+
+    def forward(self, y):                  # y: [B,T,R*Dh]
+        B,T,_ = y.shape
+        y = y.view(B, T, self.R, self.Dh)  # [B,T,R,Dh]
+        if self.shared:
+            z = self.ff2(F.gelu(self.ff1(self.ln(y))))
+        else:
+            z_list = []
+            for r in range(self.R):
+                zr = self.ff2[r](F.gelu(self.ff1[r](self.ln(y[:,:,r,:]))))
+                z_list.append(zr.unsqueeze(2))
+            z = torch.cat(z_list, dim=2)   # [B,T,R,Dh]
+        z = self.drop(z)
+        return z.view(B, T, self.R*self.Dh)
+    
 class RegionAttention(nn.Module): 
     @beartype
     def __init__(self, num_regions: int, d_embed: int, d_model: int, num_heads: int, dropout: nn.Dropout):
@@ -139,22 +168,16 @@ class RegionAttention(nn.Module):
         self.drop = dropout
         self.d_head = d_model // num_heads # num_heads = num_regions in this case
         self.num_regions = num_regions
+        self.alpha = nn.Parameter(torch.zeros(self.num_regions))  # gating to avoid residuals dominating
         
         self.scale = math.sqrt(self.d_head)
-        self.residual_proj = nn.Linear(d_embed, d_model)  # Project residuals to d_model
-        self.ln1 = nn.LayerNorm(d_model, eps=1e-5)
-        self.ln2 = nn.LayerNorm(d_model, eps=1e-5)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, 4 * d_model),
-            nn.GELU(),
-            nn.Linear(4 * d_model, d_model),
-            nn.Dropout(self.drop.p),
-        ) # TODO: separate it out into regions, else we mix information again (for later layers)!
-        #######
+        
         self.W_Q = nn.Parameter(torch.empty(self.num_regions, self.d_embed, self.d_head))   
         self.W_K = nn.Parameter(torch.empty(self.num_regions, self.d_embed, self.d_head))
         self.W_V = nn.Parameter(torch.empty(self.num_regions, self.d_embed, self.d_head))
+        self.W_RES = nn.Parameter(torch.empty(self.num_regions, self.d_embed, self.d_head))
 
+        nn.init.xavier_uniform_(self.W_RES)       
         nn.init.xavier_uniform_(self.W_Q)
         nn.init.xavier_uniform_(self.W_K)
         nn.init.xavier_uniform_(self.W_V)
@@ -176,10 +199,13 @@ class RegionAttention(nn.Module):
 
         attn_scores = torch.einsum('bhtd,bhsd->bhts', Q, K) / self.scale
         attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_weights = self.drop(attn_weights)
         attn_out = torch.einsum('bhts,bhsd->bhtd', attn_weights, V)    # [B,H,Tq,d_head]
+        residuals = torch.stack([x_q @ self.W_RES[i] for i in range(self.num_regions)], dim=1)  # [B,H,T,Dh]
+
+        attn_out = attn_out + self.alpha.view(1, self.num_regions, 1, 1) * residuals
         B, H, Tq, Dh = attn_out.shape
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, Tq, H*Dh)  # [B,Tq,d_model]
+
         return attn_out
 
     def forward(self, src_all, q_region_index):
@@ -188,26 +214,26 @@ class RegionAttention(nn.Module):
         x_q = src_all[:, :, s:e] # [B,T,d_embed]
 
         # Pre-LN attention block - could do residual inside of attention module instead (avoid expansion)
-        y = self.residual_proj(x_q) + self._mh_region_attn(x_q, src_all)             
-        # Pre-LN FFN block
-        # This is fine for the first layer but afterwards a joint ffn leads to region mixing and no clear region pair 
-        # interpretation of attention weights
-        out = y + self.ffn(self.ln2(y))                                 
+        out = self._mh_region_attn(x_q, src_all)             
+        out = self.drop(out)  # Dropout after attention
         return out
 
 class RegionEncoder(nn.Module):
-    #TODO: Debug Encoder!!
     @beartype
     def __init__(self, layers: nn.ModuleList, num_regions: int, d_model: int, d_head: int, drop: nn.Dropout, region_batch_size: int):
         super().__init__()
         self.layers = layers
         self.num_regions = num_regions
-        self.d_model = d_model
+        self.d_model = d_model # d_model = d_head * num_regions
         self.d_head = d_head
         self.drop = drop
 
+        self.ffn = GroupedFFN(num_regions, d_head, mult=4, dropout=drop, shared=True)  # Shared FFN across regions
         # Final projection back to d_model
-        self.out_proj = nn.ModuleList([nn.Linear(self.d_model, self.d_head) for _ in range(self.num_regions)])
+        self.out_proj = nn.ModuleList([
+            nn.Linear(self.num_regions * self.d_head, self.d_head)  # (R*Dh) -> Dh
+            for _ in range(self.num_regions)
+        ])
 
     def forward(self, src: Tensor) -> Tensor:
         """
@@ -218,45 +244,25 @@ class RegionEncoder(nn.Module):
             Tensor of shape [B, T, d_model] - output sequence data after region-wise attention.
         """
 
-        B, T, _ = src.shape
+        # assume d_model = R * Dh
+        prev = src                              # [B,T,R*Dh]
 
-        # 1) Prepare input for each region
-        out_regions = [src.clone() for _ in range(self.num_regions)]  # each [B,T,d_model]
+        for layer_list in self.layers:          # one list of R RegionAttention modules
+            # per-query-region attention outputs (each returns [B,T,R*Dh])
+            proj = []  # list of [B,T,R*Dh] outputs
+            for i, attn in enumerate(layer_list):
+                y_i = attn(prev, q_region_index=i)        # [B,T,R*Dh]
+                proj.append(self.out_proj[i](y_i))        # [B,T,Dh]
+            next_ = torch.cat(proj, dim=-1) 
 
-        # 2) layer-wise, region-wise attention
-        for l, layer_list in enumerate(self.layers):                # for each transformer layer
-            next_out = []
-            for i, attn_module in enumerate(layer_list):  # for each region i
-                #y_prev = out_regions[i]
-                y_i = attn_module(out_regions[i], q_region_index=i)
-                next_out.append(y_i)
-                """
-                with torch.no_grad():
-                    delta = (y_i - y_prev).norm().item()
-                    #print(f"[L{l} R{i}] Δout={delta:.3e}")
+            # shared residual 
+            y = prev + next_
+            y = y + self.ffn(y) # ffn includes layernorm
+            prev = y
 
-                    # attn stats
-                    w = attn_module.debug.get('weights', None)
-                    if w is not None:
-                        H = attn_entropy(w)
-                        #print(f"[L{l} R{i}] attn_entropy={H:.3f} (higher==more diffuse)")
-
-                """
-                
-
-            out_regions = next_out
-        
-        out = torch.stack(out_regions, dim=2)  # Shape: (B, T, R, d_model)
-
-        out = out.contiguous().view(B, T, self.num_regions * self.d_model)  # [B, T, d_model * R]
-        out = self.drop(out)  
-
-        projections = []
-        for i in range(self.num_regions):
-            projections.append(self.out_proj[i](out[:, :, i * self.d_model:(i + 1) * self.d_model]))  # Project each region's output
-        # ffn
-        out = torch.cat(projections, dim=2)  
-        return out  # Output shape: [B, T, d_model] - concatenated across regions
+        out = prev
+        # Final output shape: [B, T, d_model]
+        return out
 
 
 class TransformerModel(nn.Module):
