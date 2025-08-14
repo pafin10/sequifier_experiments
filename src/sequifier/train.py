@@ -131,41 +131,76 @@ def format_number(number: Union[int, float, np.float32]) -> str:
 
 
 class GroupedFFN(nn.Module):
-    @beartype
-    def __init__(self, R, Dh, mult=4, dropout=0.0, shared=True):
+    """
+    Two FFN modes:
+      - shared_per_region: one FFN shared across regions, applied per region with LN over Dh
+      - shared_global    : one FFN over concatenated regions with LN over R*Dh
+    """
+    def __init__(
+        self,
+        num_regions: int,
+        d_head: int,
+        mult: int = 4,
+        dropout: float = 0.1,
+        mode: str = "shared_per_region",   # or "shared_global"
+    ):
         super().__init__()
-        self.R, self.Dh, self.shared = R, Dh, shared
-        self.ln = nn.LayerNorm(Dh)
-        self.drop = dropout
-        if shared:
-            self.ff1 = nn.Linear(Dh, mult*Dh)
-            self.ff2 = nn.Linear(mult*Dh, Dh)
-        else:
-            self.ff1 = nn.ModuleList([nn.Linear(Dh, mult*Dh) for _ in range(R)])
-            self.ff2 = nn.ModuleList([nn.Linear(mult*Dh, Dh) for _ in range(R)])
+        assert mode in {"shared_per_region", "shared_global"}
+        self.R = num_regions
+        self.Dh = d_head
+        self.mode = mode
+        self.drop = nn.Dropout(dropout)
 
-    def forward(self, y):                  # y: [B,T,R*Dh]
-        B,T,_ = y.shape
-        y = y.view(B, T, self.R, self.Dh)  # [B,T,R,Dh]
-        if self.shared:
-            z = self.ff2(F.gelu(self.ff1(self.ln(y))))
+        if mode == "shared_per_region":
+            # LN over Dh, then FFN(Dh -> mult*Dh -> Dh), SAME weights for all regions
+            self.ln = nn.LayerNorm(d_head)
+            self.ff1 = nn.Linear(d_head, mult * d_head)
+            self.ff2 = nn.Linear(mult * d_head, d_head)
         else:
-            z_list = []
-            for r in range(self.R):
-                zr = self.ff2[r](F.gelu(self.ff1[r](self.ln(y[:,:,r,:]))))
-                z_list.append(zr.unsqueeze(2))
-            z = torch.cat(z_list, dim=2)   # [B,T,R,Dh]
-        z = self.drop(z)
-        return z.view(B, T, self.R*self.Dh)
+            # LN over R*Dh, then FFN(R*Dh -> mult*R*Dh -> R*Dh)
+            d_model = num_regions * d_head
+            self.ln = nn.LayerNorm(d_model)
+            self.ff1 = nn.Linear(d_model, mult * d_model)
+            self.ff2 = nn.Linear(mult * d_model, d_model)
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        """
+        y: [B, T, R*Dh]
+        returns: [B, T, R*Dh]
+        """
+        B, T, D = y.shape
+        assert D == self.R * self.Dh, f"got D={D}, expected R*Dh={self.R*self.Dh}"
+
+        if self.mode == "shared_per_region":
+            # reshape to apply LN/FFN per region (same weights for all regions)
+            y_per = y.view(B, T, self.R, self.Dh).contiguous()   # [B, T, R, Dh]
+            y_per = self.ln(y_per)                               # LN over Dh
+            z = self.ff1(y_per)                                  # (..., Dh)->(..., mult*Dh)
+            z = F.gelu(z)
+            z = self.drop(z)
+            out = self.ff2(z)                                    # (..., mult*Dh)->(..., Dh)
+            out = self.drop(out)
+            out = out.view(B, T, self.R * self.Dh).contiguous()  # back to [B, T, R*Dh]
+            return out
+
+        else:  # "shared_global"
+            # treat all regions as one big vector
+            y_glob = self.ln(y)                                  # LN over R*Dh
+            z = self.ff1(y_glob)                                 # [B, T, R*Dh] -> [B, T, mult*R*Dh]
+            z = F.gelu(z)
+            z = self.drop(z)
+            out = self.ff2(z)                                    # -> [B, T, R*Dh]
+            out = self.drop(out)
+            return out
     
 class RegionAttention(nn.Module): 
     @beartype
-    def __init__(self, num_regions: int, d_embed: int, d_model: int, num_heads: int, dropout: nn.Dropout):
+    def __init__(self, num_regions: int, d_embed: int, d_model: int, num_heads: int, dropout: float):
         super().__init__()
         self.d_embed = d_embed
         self.d_model = d_model
         self.nhead = num_heads
-        self.drop = dropout
+        self.drop = nn.Dropout(dropout)
         self.d_head = d_model // num_heads # num_heads = num_regions in this case
         self.num_regions = num_regions
         self.alpha = nn.Parameter(torch.zeros(self.num_regions))  # gating to avoid residuals dominating
@@ -175,9 +210,7 @@ class RegionAttention(nn.Module):
         self.W_Q = nn.Parameter(torch.empty(self.num_regions, self.d_embed, self.d_head))   
         self.W_K = nn.Parameter(torch.empty(self.num_regions, self.d_embed, self.d_head))
         self.W_V = nn.Parameter(torch.empty(self.num_regions, self.d_embed, self.d_head))
-        self.W_RES = nn.Parameter(torch.empty(self.num_regions, self.d_embed, self.d_head))
 
-        nn.init.xavier_uniform_(self.W_RES)       
         nn.init.xavier_uniform_(self.W_Q)
         nn.init.xavier_uniform_(self.W_K)
         nn.init.xavier_uniform_(self.W_V)
@@ -200,40 +233,38 @@ class RegionAttention(nn.Module):
         attn_scores = torch.einsum('bhtd,bhsd->bhts', Q, K) / self.scale
         attn_weights = F.softmax(attn_scores, dim=-1)
         attn_out = torch.einsum('bhts,bhsd->bhtd', attn_weights, V)    # [B,H,Tq,d_head]
-        residuals = torch.stack([x_q @ self.W_RES[i] for i in range(self.num_regions)], dim=1)  # [B,H,T,Dh]
 
-        attn_out = attn_out + self.alpha.view(1, self.num_regions, 1, 1) * residuals
         B, H, Tq, Dh = attn_out.shape
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, Tq, H*Dh)  # [B,Tq,d_model]
 
         return attn_out
 
     def forward(self, src_all, q_region_index):
-        # src_all = self.ln1(src_all)  # LayerNorm on the entire input sequence
         s, e = q_region_index*self.d_embed, (q_region_index+1)*self.d_embed
         x_q = src_all[:, :, s:e] # [B,T,d_embed]
 
-        # Pre-LN attention block - could do residual inside of attention module instead (avoid expansion)
+        # Pre-LN attention block 
         out = self._mh_region_attn(x_q, src_all)             
-        out = self.drop(out)  # Dropout after attention
         return out
 
 class RegionEncoder(nn.Module):
     @beartype
-    def __init__(self, layers: nn.ModuleList, num_regions: int, d_model: int, d_head: int, drop: nn.Dropout, region_batch_size: int):
+    def __init__(self, layers: nn.ModuleList, num_regions: int, d_model: int, d_head: int, drop: float):
         super().__init__()
         self.layers = layers
         self.num_regions = num_regions
         self.d_model = d_model # d_model = d_head * num_regions
         self.d_head = d_head
-        self.drop = drop
+        self.drop = nn.Dropout(drop)
 
-        self.ffn = GroupedFFN(num_regions, d_head, mult=4, dropout=drop, shared=True)  # Shared FFN across regions
+        self.ffn = GroupedFFN(num_regions=num_regions, d_head=d_head, mult=4, dropout=drop, mode="shared_global")  # Shared FFN across regions
         # Final projection back to d_model
         self.out_proj = nn.ModuleList([
             nn.Linear(self.num_regions * self.d_head, self.d_head)  # (R*Dh) -> Dh
             for _ in range(self.num_regions)
         ])
+        self.ln1 = nn.LayerNorm(self.d_model)  # LayerNorm over d_model
+        self.ln2 = nn.LayerNorm(self.d_model)  # LayerNorm over d_model
 
     def forward(self, src: Tensor) -> Tensor:
         """
@@ -245,18 +276,21 @@ class RegionEncoder(nn.Module):
         """
 
         # assume d_model = R * Dh
-        prev = src                              # [B,T,R*Dh]
+        prev = src                  # [B,T,R*Dh]
 
         for layer_list in self.layers:          # one list of R RegionAttention modules
+            prev = self.ln1(prev)  # LayerNorm over d_model
             # per-query-region attention outputs (each returns [B,T,R*Dh])
             proj = []  # list of [B,T,R*Dh] outputs
             for i, attn in enumerate(layer_list):
                 y_i = attn(prev, q_region_index=i)        # [B,T,R*Dh]
                 proj.append(self.out_proj[i](y_i))        # [B,T,Dh]
-            next_ = torch.cat(proj, dim=-1) 
+            
+            attn_out = torch.cat(proj, dim=-1) 
+            attn_out = self.drop(attn_out)  # Dropout after attention
 
             # shared residual 
-            y = prev + next_
+            y = prev + attn_out
             y = y + self.ffn(y) # ffn includes layernorm
             prev = y
 
@@ -304,6 +338,7 @@ class TransformerModel(nn.Module):
         self.early_stopping_epochs = hparams.training_spec.early_stopping_epochs
         self.hparams = hparams
         self.drop = nn.Dropout(hparams.training_spec.dropout)
+        self.dropout_float = hparams.training_spec.dropout
         self.encoder = ModuleDict()
         self.pos_encoder = ModuleDict()
         self.embedding_size = max(
@@ -343,10 +378,10 @@ class TransformerModel(nn.Module):
             # encoder
             self.layers = nn.ModuleList(
                 nn.ModuleList([RegionAttention(num_regions=self.R, d_embed=self.d_col, d_model=self.embedding_size, 
-                    num_heads=self.R, dropout=self.drop) for _ in range(self.R)])
+                    num_heads=self.R, dropout=self.dropout_float) for _ in range(self.R)])
                 for _ in range(hparams.model_spec.nlayers)
             )
-            self.region_encoder = RegionEncoder(self.layers, self.R, self.embedding_size, self.d_col, self.drop, 5)
+            self.region_encoder = RegionEncoder(self.layers, self.R, self.embedding_size, self.d_col, self.dropout_float)
             
         else: 
             encoder_layers = TransformerEncoderLayer( 
@@ -613,8 +648,8 @@ class TransformerModel(nn.Module):
             ):
                 epoch_start_time = time.time()
                 #self.overfit_one_batch(X_train, y_train, steps=4000, bs=16, lr=1e-2)  # Optional: Overfit one batch for debugging
-                train_loss = self._train_epoch(X_train, y_train, epoch)
-                #self.train_on_subset(X_train, y_train, steps=2000, subset_batches=8, bs=32, lr=1e-2)  # Optional: Train on a subset for debugging
+                #train_loss = self._train_epoch(X_train, y_train, epoch)
+                self.train_on_subset(X_train, y_train, steps=2000, subset_batches=8, bs=32, lr=1e-2)  # Optional: Train on a subset for debugging
                 # TODO: training on subset, loss clearly decreases -> check why same setup doesnt work / generalize on full data
                 total_loss, total_losses, output = self._evaluate(X_valid, y_valid)
                 elapsed = time.time() - epoch_start_time
@@ -692,7 +727,6 @@ class TransformerModel(nn.Module):
         self.train()
         #opt = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=0.0)
         opt = self.optimizer
-        breakpoint()
         cached_subset = self._cache_subset(X, y, subset_batches, bs)
 
         it = 0
