@@ -291,7 +291,7 @@ class RegionEncoder(nn.Module):
 
             # shared residual 
             y = prev + attn_out
-            y = y + self.ffn(y) # ffn includes layernorm
+            y = self.ffn(y) # ffn includes layernorm
             prev = y
 
         out = prev
@@ -648,8 +648,8 @@ class TransformerModel(nn.Module):
             ):
                 epoch_start_time = time.time()
                 #self.overfit_one_batch(X_train, y_train, steps=4000, bs=16, lr=1e-2)  # Optional: Overfit one batch for debugging
-                #train_loss = self._train_epoch(X_train, y_train, epoch)
-                self.train_on_subset(X_train, y_train, steps=2000, subset_batches=8, bs=32, lr=1e-2)  # Optional: Train on a subset for debugging
+                train_loss = self._train_epoch(X_train, y_train, epoch)
+                # self.train_on_subset(X_train, y_train, steps=2000, subset_batches=8, bs=32, lr=1e-2)  # Optional: Train on a subset for debugging
                 # TODO: training on subset, loss clearly decreases -> check why same setup doesnt work / generalize on full data
                 total_loss, total_losses, output = self._evaluate(X_valid, y_valid)
                 elapsed = time.time() - epoch_start_time
