@@ -207,13 +207,24 @@ class RegionAttention(nn.Module):
         
         self.scale = math.sqrt(self.d_head)
         
-        self.W_Q = nn.Parameter(torch.empty(self.num_regions, self.d_embed, self.d_head))   
-        self.W_K = nn.Parameter(torch.empty(self.num_regions, self.d_embed, self.d_head))
-        self.W_V = nn.Parameter(torch.empty(self.num_regions, self.d_embed, self.d_head))
+        self.W_Q = nn.ParameterList([
+            nn.Parameter(torch.empty(self.d_embed, self.d_head)) 
+            for _ in range(self.num_regions)
+        ])
+        self.W_K = nn.ParameterList([
+            nn.Parameter(torch.empty(self.d_embed, self.d_head)) 
+            for _ in range(self.num_regions)
+        ])
+        self.W_V = nn.ParameterList([
+            nn.Parameter(torch.empty(self.d_embed, self.d_head)) 
+            for _ in range(self.num_regions)
+        ])
 
-        nn.init.xavier_uniform_(self.W_Q)
-        nn.init.xavier_uniform_(self.W_K)
-        nn.init.xavier_uniform_(self.W_V)
+        # Initialize each parameter properly
+        for i in range(self.num_regions):
+            nn.init.xavier_uniform_(self.W_Q[i], gain=1.0)
+            nn.init.xavier_uniform_(self.W_K[i], gain=1.0)
+            nn.init.xavier_uniform_(self.W_V[i], gain=1.0)
 
     
     def _mh_region_attn(self, x_q, src_all):
@@ -231,8 +242,21 @@ class RegionAttention(nn.Module):
         V = torch.stack(Vs, dim=1)                                     # [B,H,Tk,d_head]
 
         attn_scores = torch.einsum('bhtd,bhsd->bhts', Q, K) / self.scale
+        attn_scores = attn_scores - attn_scores.max(dim=-1, keepdim=True).values
+
         attn_weights = F.softmax(attn_scores, dim=-1)
         attn_out = torch.einsum('bhts,bhsd->bhtd', attn_weights, V)    # [B,H,Tq,d_head]
+
+        ### DEBUG
+        eps = 1e-12
+        entropy = -(attn_weights * (attn_weights + eps).log()).sum(dim=-1)
+        entropy_mean = entropy.mean().item()
+        #print("Mean attention entropy:", entropy_mean)
+
+        #### ISSUE: essentially no variable attention weights, all heads are similar
+        attn_weights_mean_per_head = attn_weights.mean(dim=-1)  # shape: [B, H, Tq]
+        attn_weights_mean_diff = attn_weights_mean_per_head.std(dim=1).mean().item()
+        #print("head diversity std:", attn_weights_mean_diff)
 
         B, H, Tq, Dh = attn_out.shape
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, Tq, H*Dh)  # [B,Tq,d_model]
@@ -257,7 +281,7 @@ class RegionEncoder(nn.Module):
         self.d_head = d_head
         self.drop = nn.Dropout(drop)
 
-        self.ffn = GroupedFFN(num_regions=num_regions, d_head=d_head, mult=4, dropout=drop, mode="shared_global")  # Shared FFN across regions
+        self.ffn = GroupedFFN(num_regions=num_regions, d_head=d_head, mult=4, dropout=drop, mode="shared_per_region")  # Shared FFN across regions
         # Final projection back to d_model
         self.out_proj = nn.ModuleList([
             nn.Linear(self.num_regions * self.d_head, self.d_head)  # (R*Dh) -> Dh
@@ -278,19 +302,23 @@ class RegionEncoder(nn.Module):
         # assume d_model = R * Dh
         prev = src                  # [B,T,R*Dh]
 
+        # checked variance across heads and module outputs -> outputs are nontrivial and heterogeneous!
+
         for layer_list in self.layers:          # one list of R RegionAttention modules
             prev = self.ln1(prev)  # LayerNorm over d_model
             # per-query-region attention outputs (each returns [B,T,R*Dh])
             proj = []  # list of [B,T,R*Dh] outputs
             for i, attn in enumerate(layer_list):
-                y_i = attn(prev, q_region_index=i)        # [B,T,R*Dh]
+                y_i = attn(prev, q_region_index=i)        # [B,T,R*Dh]                
                 proj.append(self.out_proj[i](y_i))        # [B,T,Dh]
             
+           
             attn_out = torch.cat(proj, dim=-1) 
             attn_out = self.drop(attn_out)  # Dropout after attention
 
             # shared residual 
             y = prev + attn_out
+            # y = attn_out # no residual for testing
             y = self.ffn(y) # ffn includes layernorm
             prev = y
 
@@ -421,13 +449,13 @@ class TransformerModel(nn.Module):
             self.device
         )
 
-        self._init_weights() # Initialize weights - rn he init
+        self._init_weights(he_init=False) # Initialize weights - he init or default
         self.optimizer = self._get_optimizer(
             **self._filter_key(hparams.training_spec.optimizer, "name")
         )
         #### EDIT #####
-        for g in self.optimizer.param_groups:
-            g["weight_decay"] = 0.0
+        #for g in self.optimizer.param_groups:
+         #   g["weight_decay"] = 0.0
         ###############
         
         self.scheduler = self._get_scheduler(
@@ -501,31 +529,44 @@ class TransformerModel(nn.Module):
         return {k: v for k, v in dict_.items() if k != key}
 
     @beartype
-    def _init_weights(self) -> None:
-        # fan_in mode, nonlinearity='relu' is ideal for ReLU nets
-        for col in self.categorical_columns:
-            init.kaiming_normal_(
-                self.encoder[col].weight,
-                mode="fan_in",
-                nonlinearity="relu"
-            )
+    def _init_weights(self, he_init: bool) -> None:
+        if he_init:
+            # fan_in mode, nonlinearity='relu' is ideal for ReLU nets
+            for col in self.categorical_columns:
+                init.kaiming_normal_(
+                    self.encoder[col].weight,
+                    mode="fan_in",
+                    nonlinearity="relu"
+                )
 
-        for target_column in self.target_columns:
-            # biases to zero
-            self.decoder[target_column].bias.data.zero_()
-            # Kaiming on decoder weights
-            init.kaiming_normal_(
-                self.decoder[target_column].weight,
-                mode="fan_in",
-                nonlinearity="relu"
-            )
+            for target_column in self.target_columns:
+                # biases to zero
+                self.decoder[target_column].bias.data.zero_()
+                # Kaiming on decoder weights
+                init.kaiming_normal_(
+                    self.decoder[target_column].weight,
+                    mode="fan_in",
+                    nonlinearity="relu"
+                )
 
-        for col_name in self.pos_encoder:
-            init.kaiming_normal_(
-                self.pos_encoder[col_name].weight,
-                mode="fan_in",
-                nonlinearity="relu"
-            )
+            for col_name in self.pos_encoder:
+                init.kaiming_normal_(
+                    self.pos_encoder[col_name].weight,
+                    mode="fan_in",
+                    nonlinearity="relu"
+                )
+        else:
+            init_std = 0.02
+            for col in self.categorical_columns:
+                self.encoder[col].weight.data.normal_(mean=0.0, std=init_std)
+
+            for target_column in self.target_columns:
+                self.decoder[target_column].bias.data.zero_()
+                self.decoder[target_column].weight.data.normal_(mean=0.0, std=init_std)
+
+            for col_name in self.pos_encoder:
+                self.pos_encoder[col_name].weight.data.normal_(mean=0.0, std=init_std)
+
 
     @beartype
     def _recursive_concat(self, srcs: list[Tensor]):
@@ -599,6 +640,7 @@ class TransformerModel(nn.Module):
             assert self.use_embedding, "Cross attention requires embedding to be used"
             src2 = src2.transpose(0, 1)  # (B, T, d_model) for region encoder
             output = checkpoint(self.region_encoder, src2, use_reentrant=False)  
+            output = output.transpose(0, 1)  # back to (T, B, d_model)
 
         output = {
             target_column: self.decode(target_column, output)
@@ -657,7 +699,7 @@ class TransformerModel(nn.Module):
                 self._log_epoch_results(
                     epoch, elapsed, total_loss, total_losses, output
                 )
-
+                        
                 if total_loss < best_val_loss:
                     best_val_loss = total_loss
                     best_model = self._copy_model()
@@ -788,7 +830,7 @@ class TransformerModel(nn.Module):
             data, targets = self._get_batch(
                 X_train, y_train, batch_start, self.batch_size, to_device=True
             )
-            output = self.forward_train(data)
+            output = self.forward_train(data) # [B, T, 1] for each target column - already decoded
 
             # loss should already reflect your intended reduction/masking
             loss, losses = self._calculate_loss(output, targets)
