@@ -454,9 +454,12 @@ class TransformerModel(nn.Module):
             **self._filter_key(hparams.training_spec.optimizer, "name")
         )
         #### EDIT #####
-        #for g in self.optimizer.param_groups:
-         #   g["weight_decay"] = 0.0
+        #if hparams.training_spec.optimizer.get("weight_decay", None) is not None:
+         #   for g in self.optimizer.param_groups:
+          #      g["weight_decay"] = 0.02
         ###############
+        
+        print("Using optimizer:", self.optimizer.__class__.__name__, "with weight decay:", self.optimizer.param_groups[0]["weight_decay"])
         
         self.scheduler = self._get_scheduler(
             **self._filter_key(hparams.training_spec.scheduler, "name")
@@ -639,7 +642,7 @@ class TransformerModel(nn.Module):
         else:
             assert self.use_embedding, "Cross attention requires embedding to be used"
             src2 = src2.transpose(0, 1)  # (B, T, d_model) for region encoder
-            output = checkpoint(self.region_encoder, src2, use_reentrant=False)  
+            output = self.region_encoder(src2)
             output = output.transpose(0, 1)  # back to (T, B, d_model)
 
         output = {
@@ -1164,7 +1167,7 @@ class TransformerModel(nn.Module):
 
         files = glob.glob(checkpoint_path)
         files = [
-            file for file in files if os.path.split(file)[1].startswith(self.model_name)
+            file for file in files if os.path.split(file)[1].startswith(self.model_name) and "train" not in file
         ]
         if files:
             return max(files, key=os.path.getctime)

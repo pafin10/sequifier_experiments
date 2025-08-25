@@ -30,8 +30,13 @@ def infer(args: Any, args_config: dict[str, Any]) -> None:
     )
 
     config = load_inferer_config(config_path, args_config, args.on_unprocessed)
+    # added below to properly set real columns (broke during some refactoring)
+    if all(v == "real" for v in config.target_column_types.values()):
+        config.real_columns = config.target_columns.copy()
 
     if config.map_to_id or (len(config.real_columns) > 0):
+        # TODO: CHeck here, this is the relevant part where it goes into "else" but should not
+        #config.real_columns is just empty
         assert config.ddconfig_path is not None, (
             "If you want to map to id, you need to provide a file path to a json that contains: {{'id_maps':{...}}} to ddconfig_path"
             "\nIf you have real columns in the data, you need to provide a json that contains: {{'selected_columns_statistics':{COL_NAME:{'std':..., 'mean':...}}}}"
@@ -57,6 +62,7 @@ def infer(args: Any, args_config: dict[str, Any]) -> None:
         else [config.model_path]
     )
     for model_path in model_paths:
+        breakpoint()
         inferer = Inferer(
             model_path,
             config.project_path,
@@ -546,6 +552,7 @@ class Inferer:
     ):
         self.map_to_id = map_to_id
         self.selected_columns_statistics = selected_columns_statistics
+        breakpoint()  # IGNORE
         target_columns_index_map = [
             c for c in target_columns if target_column_types[c] == "categorical"
         ]
