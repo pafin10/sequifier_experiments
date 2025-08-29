@@ -300,29 +300,41 @@ class RegionEncoder(nn.Module):
         """
 
         # assume d_model = R * Dh
-        prev = src                  # [B,T,R*Dh]
+        output = src                  # [B,T,R*Dh]
 
         # checked variance across heads and module outputs -> outputs are nontrivial and heterogeneous!
 
         for layer_list in self.layers:          # one list of R RegionAttention modules
-            prev = self.ln1(prev)  # LayerNorm over d_model
+            residual = output
+            output = self.ln1(output)  # LayerNorm over d_model
             # per-query-region attention outputs (each returns [B,T,R*Dh])
             proj = []  # list of [B,T,R*Dh] outputs
             for i, attn in enumerate(layer_list):
-                y_i = attn(prev, q_region_index=i)        # [B,T,R*Dh]                
+                y_i = attn(output, q_region_index=i)        # [B,T,R*Dh]                
                 proj.append(self.out_proj[i](y_i))        # [B,T,Dh]
             
            
             attn_out = torch.cat(proj, dim=-1) 
             attn_out = self.drop(attn_out)  # Dropout after attention
 
+            """
             # shared residual 
-            y = prev + attn_out
+            y = residual + attn_out
             # y = attn_out # no residual for testing
             y = self.ffn(y) # ffn includes layernorm
-            prev = y
+            output = y
+            """
+            
+            # Empirically, the model seems to perform better with additional residual around FFN
+            x = residual + attn_out
+            residual = x
+            x = self.ffn(x)  # ffn includes layernorm
+            output = residual + x
+            
+            
+           
 
-        out = prev
+        out = output
         # Final output shape: [B, T, d_model]
         return out
 
