@@ -48,6 +48,7 @@ def train(args: Any, args_config: dict[str, Any]) -> None:
         normalize_path(config.training_data_path, config.project_path),
         config.read_format,
     )
+    breakpoint()
     if config.selected_columns is not None:
         data_train = subset_to_selected_columns(data_train, config.selected_columns)
 
@@ -740,6 +741,7 @@ class TransformerModel(nn.Module):
                 map_location=torch.device(self.device),
                 weights_only=False,
             )
+            breakpoint()
             self.load_state_dict(checkpoint["model_state_dict"])
             self.start_epoch = checkpoint["epoch"] + 1
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -754,7 +756,7 @@ class TransformerModel(nn.Module):
 
         files = glob.glob(checkpoint_path)
         files = [
-            file for file in files if os.path.split(file)[1].startswith(self.model_name)
+            file for file in files if os.path.split(file)[1].startswith(self.model_name) and "train" not in file
         ]
         if files:
             return max(files, key=os.path.getctime)
@@ -849,7 +851,6 @@ def load_inference_model(
                     module.train()
 
         model = torch.compile(model).to(device)
-
     return model
 
 

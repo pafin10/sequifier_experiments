@@ -30,6 +30,10 @@ def infer(args: Any, args_config: dict[str, Any]) -> None:
     )
 
     config = load_inferer_config(config_path, args_config, args.on_unprocessed)
+    config.real_columns = [
+        col for col in config.target_columns 
+        if config.target_column_types[col] == "real"
+    ]
 
     if config.map_to_id or (len(config.real_columns) > 0):
         assert config.ddconfig_path is not None, (
