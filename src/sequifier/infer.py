@@ -62,7 +62,6 @@ def infer(args: Any, args_config: dict[str, Any]) -> None:
         else [config.model_path]
     )
     for model_path in model_paths:
-        breakpoint()
         inferer = Inferer(
             model_path,
             config.project_path,
@@ -80,6 +79,7 @@ def infer(args: Any, args_config: dict[str, Any]) -> None:
             config.device,
             args_config=args_config,
             training_config_path=config.training_config_path,
+            attn_file=config.attn_file if hasattr(config, "attn_file") else None,
         )
 
         column_types = {
@@ -549,10 +549,10 @@ class Inferer:
         device: str,
         args_config: dict[str, Any],
         training_config_path: str,
+        attn_file: Optional[str] = None,
     ):
         self.map_to_id = map_to_id
         self.selected_columns_statistics = selected_columns_statistics
-        breakpoint()  # IGNORE
         target_columns_index_map = [
             c for c in target_columns if target_column_types[c] == "categorical"
         ]
@@ -569,6 +569,7 @@ class Inferer:
         self.sample_from_distribution_columns = sample_from_distribution_columns
         self.infer_with_dropout = infer_with_dropout
         self.inference_batch_size = inference_batch_size
+        self.attn_file = attn_file
 
         self.inference_model_type = model_path.split(".")[-1]
         self.args_config = args_config
@@ -673,7 +674,21 @@ class Inferer:
                     self.device,
                     size,
                     self.target_columns,
+                    self.attn_file if hasattr(self, "attn_file") else None,
                 )
+                # TODO: figure out how to correctly handle batches. Rn scores are collected for each region-pair, 
+                # but it's still only one batch of size 8(?). check preparation of batches and how data is passed exactly
+                if "attn_scores" in outs:
+                    attn_scores = outs["attn_scores"]
+                    if self.attn_file is not None and attn_scores is not None:
+                        if os.path.exists(self.attn_file):
+                            loaded = np.load(self.attn_file)
+                            combined = np.concatenate([loaded["scores"], attn_scores], axis=0)
+                        else:
+                            combined = attn_scores
+                        np.savez(self.attn_file, scores=combined)
+                        print(f"Appended attention scores to {self.attn_file}")
+                    outs = {k: v for k, v in outs.items() if k != "attn_scores"}
             else:
                 assert False
                 outs = {}  # for type checking

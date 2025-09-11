@@ -227,7 +227,7 @@ class RegionAttention(nn.Module):
             nn.init.xavier_uniform_(self.W_V[i], gain=1.0)
 
     
-    def _mh_region_attn(self, x_q, src_all):
+    def _mh_region_attn(self, x_q, src_all, return_scores=False):
         # x_q: [B,T,d_embed] for one query region; src_all: [B,T,R*d_embed] 
         Qs = [x_q @ self.W_Q[i] for i in range(self.num_regions)]                # list of [B,T,d_head]
         Q = torch.stack(Qs, dim=1)                                     # [B,H(=R),Tq,d_head]
@@ -242,6 +242,8 @@ class RegionAttention(nn.Module):
         V = torch.stack(Vs, dim=1)                                     # [B,H,Tk,d_head]
 
         attn_scores = torch.einsum('bhtd,bhsd->bhts', Q, K) / self.scale
+        if return_scores:
+            out_scores = attn_scores.detach().cpu()
         attn_scores = attn_scores - attn_scores.max(dim=-1, keepdim=True).values
 
         attn_weights = F.softmax(attn_scores, dim=-1)
@@ -261,25 +263,30 @@ class RegionAttention(nn.Module):
         B, H, Tq, Dh = attn_out.shape
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, Tq, H*Dh)  # [B,Tq,d_model]
 
-        return attn_out
+        if return_scores:
+            return attn_out, out_scores
+        else: 
+            return attn_out
 
-    def forward(self, src_all, q_region_index):
+    def forward(self, src_all, q_region_index, return_scores=False):
         s, e = q_region_index*self.d_embed, (q_region_index+1)*self.d_embed
         x_q = src_all[:, :, s:e] # [B,T,d_embed]
 
         # Pre-LN attention block 
-        out = self._mh_region_attn(x_q, src_all)             
+        out = self._mh_region_attn(x_q, src_all, return_scores=return_scores)  # [B,T,d_model]          
         return out
 
 class RegionEncoder(nn.Module):
     @beartype
-    def __init__(self, layers: nn.ModuleList, num_regions: int, d_model: int, d_head: int, drop: float):
+    def __init__(self, layers: nn.ModuleList, num_regions: int, d_model: int, d_head: int, 
+                 drop: float, return_scores: bool = False):
         super().__init__()
         self.layers = layers
         self.num_regions = num_regions
         self.d_model = d_model # d_model = d_head * num_regions
         self.d_head = d_head
         self.drop = nn.Dropout(drop)
+        self.return_scores = return_scores
 
         self.ffn = GroupedFFN(num_regions=num_regions, d_head=d_head, mult=4, dropout=drop, mode="shared_per_region")  # Shared FFN across regions
         # Final projection back to d_model
@@ -303,16 +310,22 @@ class RegionEncoder(nn.Module):
         output = src                  # [B,T,R*Dh]
 
         # checked variance across heads and module outputs -> outputs are nontrivial and heterogeneous!
-
+        attn_scores = []
         for layer_list in self.layers:          # one list of R RegionAttention modules
             residual = output
             output = self.ln1(output)  # LayerNorm over d_model
             # per-query-region attention outputs (each returns [B,T,R*Dh])
+
             proj = []  # list of [B,T,R*Dh] outputs
             for i, attn in enumerate(layer_list):
-                y_i = attn(output, q_region_index=i)        # [B,T,R*Dh]                
+                if self.return_scores:
+                    y_i, scores = attn(output, q_region_index=i, return_scores=self.return_scores)
+                else:
+                    y_i = attn(output, q_region_index=i, return_scores=self.return_scores)
                 proj.append(self.out_proj[i](y_i))        # [B,T,Dh]
-            
+
+                if self.return_scores:
+                    attn_scores.append(scores)
            
             attn_out = torch.cat(proj, dim=-1) 
             attn_out = self.drop(attn_out)  # Dropout after attention
@@ -331,11 +344,13 @@ class RegionEncoder(nn.Module):
             x = self.ffn(x)  # ffn includes layernorm
             output = residual + x
             
-            
-           
-
+      
         out = output
         # Final output shape: [B, T, d_model]
+        if attn_scores and self.return_scores:
+            attn_scores = torch.stack(attn_scores, dim=1)  # [B, L, H, T, T]
+            return out, attn_scores
+        
         return out
 
 
@@ -361,6 +376,7 @@ class TransformerModel(nn.Module):
         self.use_positional_encoding = hparams.model_spec.use_positional_encoding
         self.use_embedding = hparams.model_spec.use_embedding
         self.use_cross_attention = hparams.model_spec.use_cross_attention
+        self.return_scores = hparams.model_spec.return_scores 
         self.target_columns = hparams.target_columns
         self.target_column_types = hparams.target_column_types
         self.loss_weights = hparams.training_spec.loss_weights
@@ -421,7 +437,8 @@ class TransformerModel(nn.Module):
                     num_heads=self.R, dropout=self.dropout_float) for _ in range(self.R)])
                 for _ in range(hparams.model_spec.nlayers)
             )
-            self.region_encoder = RegionEncoder(self.layers, self.R, self.embedding_size, self.d_col, self.dropout_float)
+            self.region_encoder = RegionEncoder(self.layers, self.R, self.embedding_size, self.d_col, self.dropout_float,
+                                                return_scores=self.return_scores)
             
         else: 
             encoder_layers = TransformerEncoderLayer( 
@@ -456,6 +473,7 @@ class TransformerModel(nn.Module):
         self.criterion = self._init_criterion(hparams=hparams)
         self.batch_size = hparams.training_spec.batch_size
         self.accumulation_steps = hparams.training_spec.accumulation_steps
+        self.attention_scores = None
 
         self.src_mask = self._generate_square_subsequent_mask(self.seq_length).to(
             self.device
@@ -654,8 +672,14 @@ class TransformerModel(nn.Module):
         else:
             assert self.use_embedding, "Cross attention requires embedding to be used"
             src2 = src2.transpose(0, 1)  # (B, T, d_model) for region encoder
-            output = self.region_encoder(src2)
+            output = self.region_encoder(src2)  # (B, T, d_model)
+
+            #TODO: this works, but saves once for each batch / forward pass - put into inference !
+            if isinstance(output, tuple):
+                output, attn_scores = output
+                self.attention_scores = attn_scores
             output = output.transpose(0, 1)  # back to (T, B, d_model)
+
 
         output = {
             target_column: self.decode(target_column, output)
@@ -1285,6 +1309,7 @@ def infer_with_model(
     device: str,
     size: int,
     target_columns: list[str],
+    attn_file: Optional[str] = None,
 ) -> dict[str, np.ndarray]:
     outs0 = []
     with torch.no_grad():
@@ -1305,5 +1330,9 @@ def infer_with_model(
         )[:size, :]
         for target_column in target_columns
     }
+    if model.attention_scores is not None and attn_file is not None: 
+        attn_scores = model.attention_scores  # [B, L, H, T, T]
+        new_scores = attn_scores.cpu().detach()
+        outs['attn_scores'] = new_scores.numpy()[:size, :, :, :, :]
 
     return outs

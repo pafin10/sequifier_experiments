@@ -71,6 +71,7 @@ class InfererModel(BaseModel):
     ddconfig_path: str
     model_path: Union[str, list[str]]
     data_path: str
+    attn_file: Optional[str] = Field(default=None)
     training_config_path: str = Field(default="configs/train.yaml")
     read_format: str = Field(default="parquet")
     write_format: str = Field(default="csv")
