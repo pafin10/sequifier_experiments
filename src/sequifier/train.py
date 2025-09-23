@@ -235,7 +235,7 @@ class RegionAttention(nn.Module):
 
         for i in range(self.num_regions):
             s, e = i*self.d_embed, (i+1)*self.d_embed
-            Xi = src_all[:, :, s:e]                                    # [B,T,d_embed]
+            Xi = src_all[:, :, s:e]           
             Ks.append(Xi @ self.W_K[i]);  Vs.append(Xi @ self.W_V[i])
         
         K = torch.stack(Ks, dim=1)                                     # [B,H,Tk,d_head]
@@ -248,16 +248,13 @@ class RegionAttention(nn.Module):
         attn_out = torch.einsum('bhts,bhsd->bhtd', attn_weights, V)    # [B,H,Tq,d_head]
 
         ### DEBUG
+        """
         eps = 1e-12
         entropy = -(attn_weights * (attn_weights + eps).log()).sum(dim=-1)
         entropy_mean = entropy.mean().item()
         #print("Mean attention entropy:", entropy_mean)
-
-        #### ISSUE: essentially no variable attention weights, all heads are similar
-        attn_weights_mean_per_head = attn_weights.mean(dim=-1)  # shape: [B, H, Tq]
-        attn_weights_mean_diff = attn_weights_mean_per_head.std(dim=1).mean().item()
-        #print("head diversity std:", attn_weights_mean_diff)
-
+        """
+        
         B, H, Tq, Dh = attn_out.shape
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, Tq, H*Dh)  # [B,Tq,d_model]
 
@@ -268,8 +265,44 @@ class RegionAttention(nn.Module):
         x_q = src_all[:, :, s:e] # [B,T,d_embed]
 
         # Pre-LN attention block 
+        # plug in _mh_region_attn_parallel 
         out = self._mh_region_attn(x_q, src_all)             
         return out
+    
+    """
+    def _mh_region_attn_parallel(self, x_q, src_all):
+        # NOTE 1: flatten the matrix multiplication to a single operation, remove lists and stacking
+
+        # x_q: [B,T,d_embed] for one query region; src_all: [B,T,R*d_embed] 
+        Qs = [x_q @ self.W_Q[i] for i in range(self.num_regions)]                # list of [B,T,d_head]
+        Q = torch.stack(Qs, dim=1)                                     # [B,H(=R),Tq,d_head]
+        # NOTE 2: initialize Ks, Vs correctly - avoid lists
+        # tensors with correct dimensions
+
+        # NOTE 3: Collapse for loop to single operation
+        for i in range(self.num_regions):
+            s, e = i*self.d_embed, (i+1)*self.d_embed
+            Xi = src_all[:, :, s:e]           
+            Ks.append(Xi @ self.W_K[i]);  Vs.append(Xi @ self.W_V[i])
+        
+        K = torch.stack(Ks, dim=1)                                     # [B,H,Tk,d_head]
+        V = torch.stack(Vs, dim=1)                                     # [B,H,Tk,d_head]
+
+        attn_scores = torch.einsum('bhtd,bhsd->bhts', Q, K) / self.scale
+        attn_scores = attn_scores - attn_scores.max(dim=-1, keepdim=True).values
+
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_out = torch.einsum('bhts,bhsd->bhtd', attn_weights, V)    # [B,H,Tq,d_head]
+
+    """
+    def forward_parallel(self, src_all):
+        """ 
+        Parallel version, computes all query regions at once.
+        """
+
+    
+
+
 
 class RegionEncoder(nn.Module):
     @beartype
