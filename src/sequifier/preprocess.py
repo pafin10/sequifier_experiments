@@ -9,6 +9,7 @@ import numpy as np
 import polars as pl
 import pyarrow.parquet as pq
 from beartype import beartype
+from multiprocessing import get_context
 
 from sequifier.config.preprocess_config import load_preprocessor_config
 from sequifier.helpers import read_data, write_data
@@ -65,6 +66,7 @@ class Preprocessor:
         data, n_classes, id_maps, selected_columns_statistics, col_types = (
             self._process_columns(data, data_columns)
         )
+        # fine until here
         self._export_metadata(
             id_maps, n_classes, col_types, selected_columns_statistics
         )
@@ -89,7 +91,6 @@ class Preprocessor:
         schema.update(
             {str(i): sequence_position_type for i in range(seq_length - 1, -1, -1)}
         )
-
         data = data.sort(["sequenceId", "itemPosition"])
         self._process_batches(
             data,
@@ -217,8 +218,10 @@ class Preprocessor:
             if (end - start) > 0
         ]
 
-        with multiprocessing.Pool(processes=len(batches)) as pool:
+        # Issue is here
+        with get_context("spawn").Pool(processes=min(len(batches), os.cpu_count() or 1)) as pool:
             pool.starmap(preprocess_batch, batches)
+        
 
         combine_multiprocessing_outputs(
             self.project_path,
@@ -342,6 +345,7 @@ def preprocess_batch(
             )
             for i, (lb, ub) in enumerate(group_bounds)
         }
+
 
         for split_path, (group, split) in zip(split_paths, sequences.items()):
             split_path_batch_seq = split_path.replace(
