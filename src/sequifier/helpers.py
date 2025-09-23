@@ -12,6 +12,7 @@ PANDAS_TO_TORCH_TYPES = {
     "Float64": torch.float32,
     "int64": torch.int64,
     "float64": torch.float32,
+    "Float32": torch.float32,
 }
 
 
