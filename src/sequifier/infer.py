@@ -62,7 +62,6 @@ def infer(args: Any, args_config: dict[str, Any]) -> None:
         else [config.model_path]
     )
     for model_path in model_paths:
-        breakpoint()
         inferer = Inferer(
             model_path,
             config.project_path,
@@ -552,7 +551,6 @@ class Inferer:
     ):
         self.map_to_id = map_to_id
         self.selected_columns_statistics = selected_columns_statistics
-        breakpoint()  # IGNORE
         target_columns_index_map = [
             c for c in target_columns if target_column_types[c] == "categorical"
         ]

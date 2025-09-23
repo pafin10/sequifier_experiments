@@ -281,7 +281,7 @@ class RegionEncoder(nn.Module):
         self.d_head = d_head
         self.drop = nn.Dropout(drop)
 
-        self.ffn = GroupedFFN(num_regions=num_regions, d_head=d_head, mult=4, dropout=drop, mode="shared_per_region")  # Shared FFN across regions
+        self.ffn = GroupedFFN(num_regions=num_regions, d_head=d_head, mult=4, dropout=drop, mode="shared_global")  # Shared FFN across regions
         # Final projection back to d_model
         self.out_proj = nn.ModuleList([
             nn.Linear(self.num_regions * self.d_head, self.d_head)  # (R*Dh) -> Dh
