@@ -192,8 +192,8 @@ class GroupedFFN(nn.Module):
             out = self.ff2(z)                                    # -> [B, T, R*Dh]
             out = self.drop(out)
             return out
-    
-class RegionAttention(nn.Module): 
+
+class RegionAttention(nn.Module):
     @beartype
     def __init__(self, num_regions: int, d_embed: int, d_model: int, num_heads: int, dropout: float):
         super().__init__()
@@ -201,53 +201,40 @@ class RegionAttention(nn.Module):
         self.d_model = d_model
         self.nhead = num_heads
         self.drop = nn.Dropout(dropout)
-        self.d_head = d_model // num_heads # num_heads = num_regions in this case
+        self.d_head = d_model // num_heads
         self.num_regions = num_regions
-        self.alpha = nn.Parameter(torch.zeros(self.num_regions))  # gating to avoid residuals dominating
-        
-        self.scale = math.sqrt(self.d_head)
-        
-        self.W_Q = nn.Parameter(torch.randn(self.num_regions, self.d_embed, self.d_head))
-        self.W_K = nn.Parameter(torch.randn(self.num_regions, self.d_embed, self.d_head))
-        self.W_V = nn.Parameter(torch.randn(self.num_regions, self.d_embed, self.d_head))
+        self.alpha = nn.Parameter(torch.zeros(self.num_regions))
 
-        # Initialize each parameter properly
-        for i in range(self.num_regions):
-            nn.init.xavier_uniform_(self.W_Q[i], gain=1.0)
-            nn.init.xavier_uniform_(self.W_K[i], gain=1.0)
-            nn.init.xavier_uniform_(self.W_V[i], gain=1.0)
+        self.W_Q = nn.Parameter(torch.empty(self.num_regions, self.d_embed, self.d_head))
+        # Optimized: Fused weight matrix for K and V
+        self.W_KV = nn.Parameter(torch.empty(self.num_regions, self.d_embed, 2 * self.d_head))
 
-    
-    def _mh_region_attn_functional(self, x_q, src_all):
+        nn.init.xavier_uniform_(self.W_Q, gain=1.0)
+        nn.init.xavier_uniform_(self.W_KV[..., :self.d_head], gain=1.0) # K weights
+        nn.init.xavier_uniform_(self.W_KV[..., self.d_head:], gain=1.0) # V weights
+
+
+    def _mh_region_attn_optimized(self, x_q, src_all):
         """
-        A functional and parallelized implementation of multi-head region attention.
+        A fully optimized implementation using fused projections and Flash Attention.
         """
-        # x_q: [B, T, d_embed] for one query region
-        # src_all: [B, T, R*d_embed] containing data for all regions
         B, Tq, _ = x_q.shape
         _, Tk, _ = src_all.shape
-        H = self.num_regions # Number of Heads is the number of regions
+        H = self.num_regions
 
+        # 1. Q Projection
         Q = torch.einsum('btd, hde -> bhte', x_q, self.W_Q) # [B, H, Tq, d_head]
 
-        # Reshape src_all to isolate the region (head) dimension
-        src_reshaped = src_all.view(B, Tk, H, self.d_embed) # [B, Tk, H, d_embed]
+        # 2. Fused K/V Projection
+        src_reshaped = src_all.view(B, Tk, H, self.d_embed)
+        kv_out = torch.einsum('bshd, hde -> bhse', src_reshaped, self.W_KV) # [B, H, Tk, 2*d_head]
+        K, V = kv_out.split(self.d_head, dim=-1) # More flexible than chunk
 
-        # Calculate K and V for all heads in parallel
-        # b: batch, s: source time, h: head, d: d_embed, e: d_head
-        K = torch.einsum('bshd, hde -> bhse', src_reshaped, self.W_K) # [B, H, Tk, d_head]
-        V = torch.einsum('bshd, hde -> bhse', src_reshaped, self.W_V) # [B, H, Tk, d_head]
+        # 3. ⚡️ Fused Scaled Dot-Product Attention (Flash Attention)
+        # This single function replaces the manual matmul, scale, softmax, and output matmul.
+        attn_out = F.scaled_dot_product_attention(Q, K, V) # [B, H, Tq, d_head]
 
-        # --- The rest of the attention logic is already efficient ---
-        # It uses vectorized operations and remains unchanged.
-        # [B,H,Tq,d_head] @ [B,H,d_head,Tk] -> [B,H,Tq,Tk]
-        attn_scores = torch.einsum('bhte, bhse -> bhts', Q, K) / self.scale
-        attn_scores = attn_scores - attn_scores.max(dim=-1, keepdim=True).values # stable softmax
-
-        attn_weights = F.softmax(attn_scores, dim=-1) # [B, H, Tq, Tk]
-        attn_out = torch.einsum('bhts, bhse -> bhte', attn_weights, V) # [B, H, Tq, d_head]
-
-        # Reshape output to combine heads
+        # 4. Reshape output
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, Tq, H * self.d_head) # [B, Tq, d_model]
 
         return attn_out
