@@ -232,7 +232,7 @@ class RegionAttention(nn.Module):
 
         # 3. ⚡️ Fused Scaled Dot-Product Attention (Flash Attention)
         # This single function replaces the manual matmul, scale, softmax, and output matmul.
-        attn_out = F.scaled_dot_product_attention(Q, K, V) # [B, H, Tq, d_head]
+        attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=True) # [B, H, Tq, d_head]
 
         # 4. Reshape output
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, Tq, H * self.d_head) # [B, Tq, d_model]
