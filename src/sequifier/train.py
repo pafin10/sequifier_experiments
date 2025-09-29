@@ -251,73 +251,135 @@ class RegionAttention(nn.Module):
     
 
 
-
-class RegionEncoder(nn.Module):
-    @beartype
-    def __init__(self, layers: nn.ModuleList, num_regions: int, d_model: int, d_head: int, drop: float):
+class ParallelRegionEncoderLayer(nn.Module):
+    """
+    An efficient, vectorized implementation of one layer of the RegionEncoder.
+    It processes all R query regions in parallel, avoiding Python loops.
+    """
+    def __init__(self, old_layer_list, old_out_proj):
         super().__init__()
-        self.layers = layers
-        self.num_regions = num_regions
-        self.d_model = d_model # d_model = d_head * num_regions
-        self.d_head = d_head
-        self.drop = nn.Dropout(drop)
+        
+        # Extract dimensions from the old modules
+        self.R = old_layer_list[0].num_regions
+        self.d_embed = old_layer_list[0].d_embed
+        self.d_head = old_layer_list[0].d_head
+        self.d_model = self.R * self.d_head
 
-        self.ffn = GroupedFFN(num_regions=num_regions, d_head=d_head, mult=4, dropout=drop, mode="shared_global")  # Shared FFN across regions
-        # Final projection back to d_model
-        self.out_proj = nn.ModuleList([
-            nn.Linear(self.num_regions * self.d_head, self.d_head)  # (R*Dh) -> Dh
-            for _ in range(self.num_regions)
-        ])
-        self.ln1 = nn.LayerNorm(self.d_model)  # LayerNorm over d_model
-        self.ln2 = nn.LayerNorm(self.d_model)  # LayerNorm over d_model
+        # --- Stack weights from the R old modules for parallel processing ---
+
+        # 1. Stack the Query projection weights
+        # Original: R modules, each with W_Q of shape [R, d_embed, d_head]
+        # New: One stacked tensor of shape [R, R, d_embed, d_head]
+        self.W_Q = nn.Parameter(torch.stack([mod.W_Q for mod in old_layer_list], dim=0))
+
+        # 2. Stack the Key/Value projection weights
+        # Original: R modules, each with W_KV of shape [R, d_embed, 2*d_head]
+        # New: One stacked tensor of shape [R, R, d_embed, 2*d_head]
+        self.W_KV = nn.Parameter(torch.stack([mod.W_KV for mod in old_layer_list], dim=0))
+
+        # 3. Stack the final output projection weights and biases
+        # Original: R linear layers, each mapping d_model -> d_head
+        # New: Batched weight/bias tensors for torch.bmm
+        self.W_out = nn.Parameter(torch.stack([p.weight for p in old_out_proj], dim=0))
+        self.B_out = nn.Parameter(torch.stack([p.bias for p in old_out_proj], dim=0))
+        # W_out shape: [R, d_head, d_model], B_out shape: [R, d_head]
+
 
     def forward(self, src: Tensor) -> Tensor:
         """
-        Forward pass through the region encoder.
-        Args:
-            src: Tensor of shape [B, T, d_model] - input sequence data.
-        Returns:
-            Tensor of shape [B, T, d_model] - output sequence data after region-wise attention.
+        src: [B, T, d_model]
         """
+        B, T, _ = src.shape
 
-        # assume d_model = R * Dh
-        output = src                  # [B,T,R*Dh]
+        # Reshape input for region-specific processing
+        # src_regions -> [B, T, R, d_embed]
+        src_regions = src.view(B, T, self.R, self.d_embed)
 
-        # checked variance across heads and module outputs -> outputs are nontrivial and heterogeneous!
+        # --- 1. Parallel Q, K, V Projections ---
+        # The 'r' dimension corresponds to the original loop's index 'i'.
+        # The 'h' dimension is the multi-head attention dimension.
+        
+        # Project each region's input using its dedicated weights to get Q.
+        # 'btrd, rhde -> rbhte' => [B,T,R,d_embed], [R,R,d_embed,d_head] -> [R,B,R,T,d_head]
+        Q = torch.einsum('btrd, rhde -> rbhte', src_regions, self.W_Q)
+        
+        # Project all regions' inputs using each module's weights to get K,V.
+        # 'bthd, rhde -> rbhte' => [B,T,R,d_embed], [R,R,d_embed,2*d_head] -> [R,B,R,T,2*d_head]
+        KV = torch.einsum('bthd, rhde -> rbhte', src_regions, self.W_KV)
+        
+        K, V = KV.split(self.d_head, dim=-1)
 
-        for layer_list in self.layers:          # one list of R RegionAttention modules
+        # Reshape for batched attention: merge query_region 'r' and batch 'b'
+        Q = Q.reshape(self.R * B, self.R, T, self.d_head)
+        K = K.reshape(self.R * B, self.R, T, self.d_head)
+        V = V.reshape(self.R * B, self.R, T, self.d_head)
+
+        # --- 2. Parallel Scaled Dot-Product Attention ---
+        # This one call performs attention for all R original loops at once.
+        attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
+        # attn_out shape: [R*B, R, T, d_head]
+        
+        # --- 3. Parallel Output Projection ---
+        # Reshape attention output to match original per-region output shape
+        # [R*B, R, T, d_head] -> [R, B, T, R, d_head] -> [R, B, T, d_model]
+        attn_out = attn_out.view(self.R, B, self.R, T, self.d_head).permute(0, 1, 3, 2, 4)
+        attn_out = attn_out.reshape(self.R, B, T, self.d_model)
+
+        # Reshape for batched matrix multiplication (bmm)
+        # [R, B, T, d_model] -> [R, B*T, d_model]
+        attn_out_reshaped = attn_out.reshape(self.R, B * T, self.d_model)
+
+        # Apply R different linear projections in parallel
+        # torch.bmm requires: [batch, n, m] @ [batch, m, p]
+        # (attn_out): [R, B*T, d_model] @ (W_out.transpose): [R, d_model, d_head]
+        proj_out = torch.bmm(attn_out_reshaped, self.W_out.transpose(1, 2))
+        # proj_out shape: [R, B*T, d_head]
+
+        # Add the stacked biases
+        proj_out = proj_out + self.B_out.unsqueeze(1)
+        
+        # --- 4. Final Concatenation ---
+        # Reshape back to the final desired format
+        # [R, B*T, d_head] -> [R, B, T, d_head] -> [B, T, R, d_head]
+        proj_out = proj_out.view(self.R, B, T, self.d_head).permute(1, 2, 0, 3)
+        
+        # Concatenate along the last dimension to get the final result
+        # [B, T, R, d_head] -> [B, T, d_model]
+        final_out = proj_out.reshape(B, T, self.d_model)
+        
+        return final_out
+    
+class RegionEncoder(nn.Module):
+    @beartype
+    def __init__(self, parallel_layers: nn.ModuleList, d_model: int, drop: float):
+        super().__init__()
+        self.layers = parallel_layers
+        self.num_regions = parallel_layers[0].R
+        self.d_head = parallel_layers[0].d_head
+        self.d_model = d_model
+        self.drop = nn.Dropout(drop)
+
+        # The FFN and LayerNorms remain the same
+        self.ffn = GroupedFFN(num_regions=self.num_regions, d_head=self.d_head, mult=4, dropout=drop, mode="shared_global")
+        self.ln1 = nn.LayerNorm(self.d_model)
+        self.ln2 = nn.LayerNorm(self.d_model)
+
+    def forward(self, src: Tensor) -> Tensor:
+        output = src
+        for layer in self.layers:
             residual = output
-            output = self.ln1(output)  # LayerNorm over d_model
-            # per-query-region attention outputs (each returns [B,T,R*Dh])
-            proj = []  # list of [B,T,R*Dh] outputs
-            for i, attn in enumerate(layer_list):
-                y_i = attn(output, q_region_index=i)        # [B,T,R*Dh]                
-                proj.append(self.out_proj[i](y_i))        # [B,T,Dh]
-            
-           
-            attn_out = torch.cat(proj, dim=-1) 
-            attn_out = self.drop(attn_out)  # Dropout after attention
+            x = self.ln1(output)
 
-            """
-            # shared residual 
-            y = residual + attn_out
-            # y = attn_out # no residual for testing
-            y = self.ffn(y) # ffn includes layernorm
-            output = y
-            """
-            
-            # Empirically, the model seems to perform better with additional residual around FFN
+            # A single call to the efficient parallel layer
+            attn_out = layer(x)
+
+            attn_out = self.drop(attn_out)
+
             x = residual + attn_out
             residual = x
-            x = self.ffn(x)  # ffn includes layernorm
+            x = self.ffn(x)
             output = residual + x
-            
-            
-           
-
-        out = output
-        # Final output shape: [B, T, d_model]
-        return out
+        return output
 
 
 class TransformerModel(nn.Module):
@@ -393,17 +455,37 @@ class TransformerModel(nn.Module):
                     self.seq_length, self.d_model_by_column[col]
                 )
         if self.use_cross_attention:
-            self.R = len(self.real_columns)  # Number of regions
-            self.d_col = self.d_model_by_column[self.real_columns[0]]  # Assuming all real columns have the same d_model_by_column
-            
-            # encoder
-            self.layers = nn.ModuleList(
+            self.R = len(self.real_columns)
+            self.d_col = self.d_model_by_column[self.real_columns[0]]
+
+            # 1. Temporarily create the old, inefficient layers to get their initialized weights
+            old_layers = nn.ModuleList(
                 nn.ModuleList([RegionAttention(num_regions=self.R, d_embed=self.d_col, d_model=self.embedding_size, 
                     num_heads=self.R, dropout=self.dropout_float) for _ in range(self.R)])
                 for _ in range(hparams.model_spec.nlayers)
             )
-            self.region_encoder = RegionEncoder(self.layers, self.R, self.embedding_size, self.d_col, self.dropout_float)
-            
+            # Also need the old output projections
+            old_out_projs = nn.ModuleList([
+                nn.ModuleList([nn.Linear(self.R * self.d_col, self.d_col) for _ in range(self.R)])
+                for _ in range(hparams.model_spec.nlayers)
+            ])
+
+            # _init_weights() call would happen here to initialize the old layers
+            self._init_weights() # Make sure this initializes old_layers and old_out_projs
+
+            # 2. Create the new, efficient parallel layers from the old ones
+            parallel_layers = nn.ModuleList([
+                ParallelRegionEncoderLayer(old_layers[i], old_out_projs[i])
+                for i in range(hparams.model_spec.nlayers)
+            ])
+
+            # 3. Create the final RegionEncoder using the efficient layers
+            self.region_encoder = RegionEncoder(parallel_layers, self.embedding_size, self.dropout_float)
+
+            # Optional: Delete the old layers to save memory
+            del old_layers
+            del old_out_projs
+
         else: 
             encoder_layers = TransformerEncoderLayer( 
                 self.embedding_size,
@@ -525,7 +607,7 @@ class TransformerModel(nn.Module):
         return {k: v for k, v in dict_.items() if k != key}
 
     @beartype
-    def _init_weights(self, he_init: bool) -> None:
+    def _init_weights(self, he_init: bool = False) -> None:
         if he_init:
             # fan_in mode, nonlinearity='relu' is ideal for ReLU nets
             for col in self.categorical_columns:
