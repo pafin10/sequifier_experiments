@@ -207,18 +207,9 @@ class RegionAttention(nn.Module):
         
         self.scale = math.sqrt(self.d_head)
         
-        self.W_Q = nn.ParameterList([
-            nn.Parameter(torch.empty(self.d_embed, self.d_head)) 
-            for _ in range(self.num_regions)
-        ])
-        self.W_K = nn.ParameterList([
-            nn.Parameter(torch.empty(self.d_embed, self.d_head)) 
-            for _ in range(self.num_regions)
-        ])
-        self.W_V = nn.ParameterList([
-            nn.Parameter(torch.empty(self.d_embed, self.d_head)) 
-            for _ in range(self.num_regions)
-        ])
+        self.W_Q = nn.Parameter(torch.randn(self.num_regions, self.d_embed, self.d_head))
+        self.W_K = nn.Parameter(torch.randn(self.num_regions, self.d_embed, self.d_head))
+        self.W_V = nn.Parameter(torch.randn(self.num_regions, self.d_embed, self.d_head))
 
         # Initialize each parameter properly
         for i in range(self.num_regions):
@@ -227,38 +218,40 @@ class RegionAttention(nn.Module):
             nn.init.xavier_uniform_(self.W_V[i], gain=1.0)
 
     
-    def _mh_region_attn(self, x_q, src_all):
-        # x_q: [B,T,d_embed] for one query region; src_all: [B,T,R*d_embed] 
-        Qs = [x_q @ self.W_Q[i] for i in range(self.num_regions)]                # list of [B,T,d_head]
-        Q = torch.stack(Qs, dim=1)                                     # [B,H(=R),Tq,d_head]
-        Ks, Vs = [], []
-
-        for i in range(self.num_regions):
-            s, e = i*self.d_embed, (i+1)*self.d_embed
-            Xi = src_all[:, :, s:e]           
-            Ks.append(Xi @ self.W_K[i]);  Vs.append(Xi @ self.W_V[i])
-        
-        K = torch.stack(Ks, dim=1)                                     # [B,H,Tk,d_head]
-        V = torch.stack(Vs, dim=1)                                     # [B,H,Tk,d_head]
-
-        attn_scores = torch.einsum('bhtd,bhsd->bhts', Q, K) / self.scale
-        attn_scores = attn_scores - attn_scores.max(dim=-1, keepdim=True).values
-
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_out = torch.einsum('bhts,bhsd->bhtd', attn_weights, V)    # [B,H,Tq,d_head]
-
-        ### DEBUG
+    def _mh_region_attn_functional(self, x_q, src_all):
         """
-        eps = 1e-12
-        entropy = -(attn_weights * (attn_weights + eps).log()).sum(dim=-1)
-        entropy_mean = entropy.mean().item()
-        #print("Mean attention entropy:", entropy_mean)
+        A functional and parallelized implementation of multi-head region attention.
         """
-        
-        B, H, Tq, Dh = attn_out.shape
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, Tq, H*Dh)  # [B,Tq,d_model]
+        # x_q: [B, T, d_embed] for one query region
+        # src_all: [B, T, R*d_embed] containing data for all regions
+        B, Tq, _ = x_q.shape
+        _, Tk, _ = src_all.shape
+        H = self.num_regions # Number of Heads is the number of regions
+
+        Q = torch.einsum('btd, hde -> bhte', x_q, self.W_Q) # [B, H, Tq, d_head]
+
+        # Reshape src_all to isolate the region (head) dimension
+        src_reshaped = src_all.view(B, Tk, H, self.d_embed) # [B, Tk, H, d_embed]
+
+        # Calculate K and V for all heads in parallel
+        # b: batch, s: source time, h: head, d: d_embed, e: d_head
+        K = torch.einsum('bshd, hde -> bhse', src_reshaped, self.W_K) # [B, H, Tk, d_head]
+        V = torch.einsum('bshd, hde -> bhse', src_reshaped, self.W_V) # [B, H, Tk, d_head]
+
+        # --- The rest of the attention logic is already efficient ---
+        # It uses vectorized operations and remains unchanged.
+        # [B,H,Tq,d_head] @ [B,H,d_head,Tk] -> [B,H,Tq,Tk]
+        attn_scores = torch.einsum('bhte, bhse -> bhts', Q, K) * self.scale
+        attn_scores = attn_scores - attn_scores.max(dim=-1, keepdim=True).values # stable softmax
+
+        attn_weights = F.softmax(attn_scores, dim=-1) # [B, H, Tq, Tk]
+        attn_out = torch.einsum('bhts, bhse -> bhte', attn_weights, V) # [B, H, Tq, d_head]
+
+        # Reshape output to combine heads
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, Tq, H * self.d_head) # [B, Tq, d_model]
 
         return attn_out
+
 
     def forward(self, src_all, q_region_index):
         s, e = q_region_index*self.d_embed, (q_region_index+1)*self.d_embed
