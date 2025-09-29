@@ -241,7 +241,7 @@ class RegionAttention(nn.Module):
         # --- The rest of the attention logic is already efficient ---
         # It uses vectorized operations and remains unchanged.
         # [B,H,Tq,d_head] @ [B,H,d_head,Tk] -> [B,H,Tq,Tk]
-        attn_scores = torch.einsum('bhte, bhse -> bhts', Q, K) * self.scale
+        attn_scores = torch.einsum('bhte, bhse -> bhts', Q, K) / self.scale
         attn_scores = attn_scores - attn_scores.max(dim=-1, keepdim=True).values # stable softmax
 
         attn_weights = F.softmax(attn_scores, dim=-1) # [B, H, Tq, Tk]
