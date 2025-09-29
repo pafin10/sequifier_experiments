@@ -214,7 +214,7 @@ class RegionAttention(nn.Module):
         nn.init.xavier_uniform_(self.W_KV[..., self.d_head:], gain=1.0) # V weights
 
 
-    def _mh_region_attn_optimized(self, x_q, src_all):
+    def _mh_region_attn(self, x_q, src_all):
         """
         A fully optimized implementation using fused projections and Flash Attention.
         """
@@ -248,38 +248,6 @@ class RegionAttention(nn.Module):
         # plug in _mh_region_attn_parallel 
         out = self._mh_region_attn(x_q, src_all)             
         return out
-    
-    """
-    def _mh_region_attn_parallel(self, x_q, src_all):
-        # NOTE 1: flatten the matrix multiplication to a single operation, remove lists and stacking
-
-        # x_q: [B,T,d_embed] for one query region; src_all: [B,T,R*d_embed] 
-        Qs = [x_q @ self.W_Q[i] for i in range(self.num_regions)]                # list of [B,T,d_head]
-        Q = torch.stack(Qs, dim=1)                                     # [B,H(=R),Tq,d_head]
-        # NOTE 2: initialize Ks, Vs correctly - avoid lists
-        # tensors with correct dimensions
-
-        # NOTE 3: Collapse for loop to single operation
-        for i in range(self.num_regions):
-            s, e = i*self.d_embed, (i+1)*self.d_embed
-            Xi = src_all[:, :, s:e]           
-            Ks.append(Xi @ self.W_K[i]);  Vs.append(Xi @ self.W_V[i])
-        
-        K = torch.stack(Ks, dim=1)                                     # [B,H,Tk,d_head]
-        V = torch.stack(Vs, dim=1)                                     # [B,H,Tk,d_head]
-
-        attn_scores = torch.einsum('bhtd,bhsd->bhts', Q, K) / self.scale
-        attn_scores = attn_scores - attn_scores.max(dim=-1, keepdim=True).values
-
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_out = torch.einsum('bhts,bhsd->bhtd', attn_weights, V)    # [B,H,Tq,d_head]
-
-    """
-    def forward_parallel(self, src_all):
-        """ 
-        Parallel version, computes all query regions at once.
-        """
-
     
 
 
