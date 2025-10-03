@@ -454,6 +454,25 @@ class TransformerModel(nn.Module):
                 self.pos_encoder[col] = nn.Embedding(
                     self.seq_length, self.d_model_by_column[col]
                 )
+
+        # DECODER INIT
+        # Need to have decoder initialized already for _init_weights() !
+        self.decoder = ModuleDict()
+        self.softmax = ModuleDict()
+        for target_column, target_column_type in self.target_column_types.items():
+            if target_column_type == "categorical":
+                self.decoder[target_column] = nn.Linear(
+                    self.embedding_size,
+                    self.n_classes[target_column],
+                )
+                self.softmax[target_column] = nn.LogSoftmax(dim=-1)
+            elif target_column_type == "real":
+                self.decoder[target_column] = nn.Linear(self.embedding_size, 1)
+            else:
+                raise ValueError(
+                    f"Target column type {target_column_type} not in ['categorical', 'real']"
+                )
+            
         if self.use_cross_attention:
             self.R = len(self.real_columns)
             self.d_col = self.d_model_by_column[self.real_columns[0]]
@@ -497,22 +516,6 @@ class TransformerModel(nn.Module):
                 encoder_layers, hparams.model_spec.nlayers, enable_nested_tensor=False
             )
 
-
-        self.decoder = ModuleDict()
-        self.softmax = ModuleDict()
-        for target_column, target_column_type in self.target_column_types.items():
-            if target_column_type == "categorical":
-                self.decoder[target_column] = nn.Linear(
-                    self.embedding_size,
-                    self.n_classes[target_column],
-                )
-                self.softmax[target_column] = nn.LogSoftmax(dim=-1)
-            elif target_column_type == "real":
-                self.decoder[target_column] = nn.Linear(self.embedding_size, 1)
-            else:
-                raise ValueError(
-                    f"Target column type {target_column_type} not in ['categorical', 'real']"
-                )
 
         self.device = hparams.training_spec.device
         self.device_max_concat_length = hparams.training_spec.device_max_concat_length
