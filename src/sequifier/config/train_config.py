@@ -116,7 +116,6 @@ def load_train_config(
     """
     with open(config_path, "r") as f:
         config_values = yaml.safe_load(f)
-
     config_values.update(args_config)
 
     if not on_unprocessed:
@@ -162,7 +161,6 @@ def load_train_config(
         )
 
         config_values["id_maps"] = dd_config["id_maps"]
-
     return TrainModel(**config_values)
 
 
