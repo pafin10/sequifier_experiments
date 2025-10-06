@@ -1022,16 +1022,16 @@ class TransformerModel(nn.Module):
 
         with torch.no_grad():
 
-            num_batches = math.ceil(
+            num_batches = max(1, math.floor(
                 X_valid[self.target_columns[0]].shape[0] / self.batch_size
-            )  # any column will do
+            ))  # any column will do
             total_loss_collect, total_losses_collect = [], []
             for batch_start in range(0, num_batches * self.batch_size, self.batch_size):
                 data, targets = self._get_batch(
                     X_valid,
                     y_valid,
                     batch_start,
-                    batch_start + self.batch_size,
+                    self.batch_size,
                     to_device=True,
                 )
                 with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=(self.device == 'cuda')):
