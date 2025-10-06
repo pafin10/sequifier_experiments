@@ -27,7 +27,7 @@ def check_equivalence():
     4. Asserting that their outputs are numerically very close.
     """
     # 1. Define hyperparameters for the test models
-    B, T, R, D_EMBED, N_LAYERS, DROP = 100, 120, 16, 64, 2, 0.1
+    B, T, R, D_EMBED, N_LAYERS, DROP = 10, 30, 16, 64, 4, 0.1
     NUM_HEADS = R
     D_MODEL = R * D_EMBED
     D_HEAD = D_EMBED  # In this architecture, d_head equals d_embed
