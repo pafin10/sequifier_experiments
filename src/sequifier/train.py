@@ -13,11 +13,12 @@ import torch
 import torch._dynamo
 from beartype import beartype
 from torch import Tensor, nn
+from torch.amp import GradScaler
 from torch.nn import ModuleDict, TransformerEncoder, TransformerEncoderLayer
 from torch.nn.functional import one_hot
 import torch.nn.functional as F
 import torch.nn.init as init
-from torch.utils.checkpoint import checkpoint 
+from torch.utils.checkpoint import checkpoint
 
 
 torch._dynamo.config.suppress_errors = True
@@ -370,8 +371,9 @@ class RegionEncoder(nn.Module):
             residual = output
             x = self.ln1(output)
 
-            # A single call to the efficient parallel layer
-            attn_out = layer(x)
+            # A single call to the efficient parallel layer, with checkpointing
+            # Trades computation for memory by not storing intermediate activations
+            attn_out = checkpoint(layer, x, use_reentrant=False)
 
             attn_out = self.drop(attn_out)
 
@@ -454,6 +456,24 @@ class TransformerModel(nn.Module):
                 self.pos_encoder[col] = nn.Embedding(
                     self.seq_length, self.d_model_by_column[col]
                 )
+
+
+        self.decoder = ModuleDict()
+        self.softmax = ModuleDict()
+        for target_column, target_column_type in self.target_column_types.items():
+            if target_column_type == "categorical":
+                self.decoder[target_column] = nn.Linear(
+                    self.embedding_size,
+                    self.n_classes[target_column],
+                )
+                self.softmax[target_column] = nn.LogSoftmax(dim=-1)
+            elif target_column_type == "real":
+                self.decoder[target_column] = nn.Linear(self.embedding_size, 1)
+            else:
+                raise ValueError(
+                    f"Target column type {target_column_type} not in ['categorical', 'real']"
+                )
+
         if self.use_cross_attention:
             self.R = len(self.real_columns)
             self.d_col = self.d_model_by_column[self.real_columns[0]]
@@ -498,22 +518,6 @@ class TransformerModel(nn.Module):
             )
 
 
-        self.decoder = ModuleDict()
-        self.softmax = ModuleDict()
-        for target_column, target_column_type in self.target_column_types.items():
-            if target_column_type == "categorical":
-                self.decoder[target_column] = nn.Linear(
-                    self.embedding_size,
-                    self.n_classes[target_column],
-                )
-                self.softmax[target_column] = nn.LogSoftmax(dim=-1)
-            elif target_column_type == "real":
-                self.decoder[target_column] = nn.Linear(self.embedding_size, 1)
-            else:
-                raise ValueError(
-                    f"Target column type {target_column_type} not in ['categorical', 'real']"
-                )
-
         self.device = hparams.training_spec.device
         self.device_max_concat_length = hparams.training_spec.device_max_concat_length
         self.criterion = self._init_criterion(hparams=hparams)
@@ -539,6 +543,10 @@ class TransformerModel(nn.Module):
         self.scheduler = self._get_scheduler(
             **self._filter_key(hparams.training_spec.scheduler, "name")
         )
+
+        # Initialize the gradient scaler for Automatic Mixed Precision (AMP)
+        # It's enabled only when training on a CUDA device.
+        self.scaler = GradScaler(enabled=(self.device == 'cuda'))
 
         self.iter_save = hparams.training_spec.iter_save
         self.continue_training = hparams.training_spec.continue_training
@@ -910,11 +918,14 @@ class TransformerModel(nn.Module):
             )
             output = self.forward_train(data) # [B, T, 1] for each target column - already decoded
 
-            # loss should already reflect your intended reduction/masking
-            loss, losses = self._calculate_loss(output, targets)
+            # AMP: Enter autocast context for forward pass and loss calculation.
+            # This enables automatic casting to float16 for performance.
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=(self.device == 'cuda')):
+                output = self.forward_train(data)
+                loss, losses = self._calculate_loss(output, targets)
 
-            # keep training dynamics IDENTICAL: do NOT rescale by accumulation_steps here
-            loss.backward()
+            # AMP: Scale the loss before backward pass to prevent gradient underflow.
+            self.scaler.scale(loss).backward()
             torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
 
             if (
@@ -922,7 +933,10 @@ class TransformerModel(nn.Module):
                 or (batch_count + 1) % self.accumulation_steps == 0
                 or (batch_count + 1) == num_batches
             ):
-                self.optimizer.step()
+                # AMP: Unscales gradients and steps the optimizer.
+                self.scaler.step(self.optimizer)
+                # AMP: Updates the scale for the next iteration.
+                self.scaler.update()
                 self.optimizer.zero_grad()
 
             # --- bookkeeping ---
@@ -942,8 +956,9 @@ class TransformerModel(nn.Module):
                 )
                 log_loss_sum = 0.0
                 start_time = time.time()
+            
+            del data, targets, output, loss, losses
 
-        # --- return proper epoch-average training loss (NEW) ---
         epoch_avg_loss = epoch_loss_sum / max(1, epoch_loss_count)
         return np.float32(epoch_avg_loss)
 
@@ -1006,6 +1021,7 @@ class TransformerModel(nn.Module):
         self.eval()  # turn on evaluation mode
 
         with torch.no_grad():
+
             num_batches = math.ceil(
                 X_valid[self.target_columns[0]].shape[0] / self.batch_size
             )  # any column will do
@@ -1018,12 +1034,13 @@ class TransformerModel(nn.Module):
                     batch_start + self.batch_size,
                     to_device=True,
                 )
-                output = self.forward_train(data)
-                total_loss_iter, total_losses_iter = self._calculate_loss(
-                    output, targets
-                )
-                total_loss_collect.append(total_loss_iter.cpu())
-                total_losses_collect.append(total_losses_iter)
+                with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=(self.device == 'cuda')):
+                    output = self.forward_train(data)
+                    total_loss_iter, total_losses_iter = self._calculate_loss(
+                        output, targets
+                    )
+                    total_loss_collect.append(total_loss_iter.cpu())
+                    total_losses_collect.append(total_losses_iter)
 
                 torch.cuda.empty_cache()
 
@@ -1172,6 +1189,7 @@ class TransformerModel(nn.Module):
                 "epoch": epoch,
                 "model_state_dict": self.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
+                "scaler_state_dict": self.scaler.state_dict(),
                 "loss": val_loss,
             },
             output_path,
@@ -1231,6 +1249,9 @@ class TransformerModel(nn.Module):
             self.load_state_dict(checkpoint["model_state_dict"])
             self.start_epoch = checkpoint["epoch"] + 1
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            # Load scaler state if it exists in the checkpoint, for resuming AMP training
+            if "scaler_state_dict" in checkpoint:
+                self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
             return f"Loading model weights from {latest_model_path}. Total params: {format_number(pytorch_total_params)}"
         else:
             self.start_epoch = 1
