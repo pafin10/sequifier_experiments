@@ -131,11 +131,54 @@ def format_number(number: Union[int, float, np.float32]) -> str:
     return f"{number_adjusted:5.2f}e{order_of_magnitude}"
 
 
+
+class BlockDiagonalLinear(nn.Module):
+    """
+    A block-diagonal linear layer implemented with a grouped 1D convolution.
+    
+    This layer is equivalent to applying a separate Dense layer to each
+    block of features in the input.
+    """
+    def __init__(self, num_blocks: int, in_features_per_block: int, out_features_per_block: int):
+        super().__init__()
+        self.num_blocks = num_blocks
+        
+        # Calculate total input and output features
+        total_in_features = num_blocks * in_features_per_block
+        total_out_features = num_blocks * out_features_per_block
+
+        # The core of the implementation is a Conv1d layer with groups.
+        # - kernel_size=1 makes it a fully-connected operation on the channel dimension.
+        # - groups=num_blocks ensures that each block is processed independently.
+        self.conv = nn.Conv1d(
+            in_channels=total_in_features,
+            out_channels=total_out_features,
+            kernel_size=1,
+            groups=num_blocks
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, num_blocks * in_features_per_block)
+        """
+        # Add a dummy spatial dimension for Conv1d: (N, C) -> (N, C, 1)
+        x = x.unsqueeze(2)
+        
+        # Apply the grouped convolution
+        output = self.conv(x)
+        
+        # Remove the dummy spatial dimension: (N, C_out, 1) -> (N, C_out)
+        output = output.squeeze(2)
+        
+        return output
+    
 class GroupedFFN(nn.Module):
     """
-    Two FFN modes:
-      - shared_per_region: one FFN shared across regions, applied per region with LN over Dh
-      - shared_global    : one FFN over concatenated regions with LN over R*Dh
+    Three FFN modes:
+      - per_region         : a separate FFN and LayerNorm for each region.
+      - shared_per_region  : one FFN and LayerNorm shared across all regions.
+      - shared_global      : one FFN and LayerNorm over the concatenated regions.
     """
     def __init__(
         self,
@@ -143,22 +186,25 @@ class GroupedFFN(nn.Module):
         d_head: int,
         mult: int = 4,
         dropout: float = 0.1,
-        mode: str = "shared_per_region",   # or "shared_global"
+        mode: str = "",
     ):
         super().__init__()
-        assert mode in {"shared_per_region", "shared_global"}
+        assert mode in {"per_region", "shared_per_region", "shared_global"}
         self.R = num_regions
         self.Dh = d_head
         self.mode = mode
         self.drop = nn.Dropout(dropout)
 
-        if mode == "shared_per_region":
-            # LN over Dh, then FFN(Dh -> mult*Dh -> Dh), SAME weights for all regions
+        if mode == "per_region":
+            # 💡 Apply LayerNorm per region (on d_head)
+            self.ln = nn.LayerNorm(d_head) 
+            self.ff1 = BlockDiagonalLinear(num_regions, d_head, mult * d_head)
+            self.ff2 = BlockDiagonalLinear(num_regions, mult * d_head, d_head)
+        elif mode == "shared_per_region":
             self.ln = nn.LayerNorm(d_head)
             self.ff1 = nn.Linear(d_head, mult * d_head)
             self.ff2 = nn.Linear(mult * d_head, d_head)
-        else:
-            # LN over R*Dh, then FFN(R*Dh -> mult*R*Dh -> R*Dh)
+        elif mode == "shared_global":
             d_model = num_regions * d_head
             self.ln = nn.LayerNorm(d_model)
             self.ff1 = nn.Linear(d_model, mult * d_model)
@@ -172,26 +218,52 @@ class GroupedFFN(nn.Module):
         B, T, D = y.shape
         assert D == self.R * self.Dh, f"got D={D}, expected R*Dh={self.R*self.Dh}"
 
-        if self.mode == "shared_per_region":
-            # reshape to apply LN/FFN per region (same weights for all regions)
-            y_per = y.view(B, T, self.R, self.Dh).contiguous()   # [B, T, R, Dh]
-            y_per = self.ln(y_per)                               # LN over Dh
-            z = self.ff1(y_per)                                  # (..., Dh)->(..., mult*Dh)
+        if self.mode == "per_region":
+            # Reshape to expose regions for LayerNorm
+            # [B, T, R*Dh] -> [B, T, R, Dh]
+            y_per = y.view(B, T, self.R, self.Dh)
+            
+            # Apply LayerNorm independently to each region's Dh features
+            y_norm = self.ln(y_per)
+            
+            # Reshape for BlockDiagonalLinear which expects a flattened batch/time dim
+            # [B, T, R, Dh] -> [B*T, R*Dh]
+            y_flat = y_norm.view(B * T, D)
+
+            z = self.ff1(y_flat)
             z = F.gelu(z)
             z = self.drop(z)
-            out = self.ff2(z)                                    # (..., mult*Dh)->(..., Dh)
+            out_flat = self.ff2(z)
+            out_flat = self.drop(out_flat)
+            
+            # Reshape back to the original tensor shape
+            out = out_flat.view(B, T, D)
+            return out
+            
+        elif self.mode == "shared_global":
+            y_glob = self.ln(y)
+            z = self.ff1(y_glob)
+            z = F.gelu(z)
+            z = self.drop(z)
+            out = self.ff2(z)
             out = self.drop(out)
-            out = out.view(B, T, self.R * self.Dh).contiguous()  # back to [B, T, R*Dh]
             return out
 
-        else:  # "shared_global"
-            # treat all regions as one big vector
-            y_glob = self.ln(y)                                  # LN over R*Dh
-            z = self.ff1(y_glob)                                 # [B, T, R*Dh] -> [B, T, mult*R*Dh]
+        elif self.mode == "shared_per_region":
+            # Reshape to apply shared layers per region
+            # [B, T, R*Dh] -> [B, T, R, Dh]
+            y_per = y.view(B, T, self.R, self.Dh)
+
+            y_norm = self.ln(y_per)
+            z = self.ff1(y_norm)
             z = F.gelu(z)
             z = self.drop(z)
-            out = self.ff2(z)                                    # -> [B, T, R*Dh]
+            out = self.ff2(z)
             out = self.drop(out)
+
+            # Reshape back to the original tensor shape
+            # [B, T, R, Dh] -> [B, T, R*Dh]
+            out = out.view(B, T, self.R * self.Dh)
             return out
 
 class RegionAttention(nn.Module):
