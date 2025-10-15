@@ -31,10 +31,26 @@ from sequifier.helpers import read_data  # noqa: E402
 from sequifier.helpers import numpy_to_pytorch, subset_to_selected_columns  # noqa: E402
 from sequifier.optimizers.optimizers import get_optimizer_class  # noqa: E402
 
+# Flash attention breaks for fMRI data - for now disable it
+torch.backends.cuda.enable_flash_sdp(False)
+torch.backends.cuda.enable_math_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(False)
+
+# Change to bfloat 16 or back to float32 / decrease learning rate -> A100 & H100
 
 torch.autograd.set_detect_anomaly(True)   # pinpoints first op that creates NaN/Inf
 
 ##### DEBUGGING FUNCTIONS #####
+
+def _check_finite(name, t):
+    if not torch.isfinite(t).all():
+        print(f"[NaN/Inf] in {name}:",
+              "min=", t.nan_to_num().min().item(),
+              "max=", t.nan_to_num().max().item(),
+              "dtype=", t.dtype, "device=", t.device, "shape=", tuple(t.shape))
+        torch.save({"tensor": t.detach().float().cpu()}, f"debug_{name}.pt")
+        raise RuntimeError(f"Non-finite values in {name}")
+
 def tensor_stats(x, name):
     with torch.no_grad():
         m = x.mean().item()
@@ -305,7 +321,15 @@ class RegionAttention(nn.Module):
 
         # 3. ⚡️ Fused Scaled Dot-Product Attention (Flash Attention)
         # This single function replaces the manual matmul, scale, softmax, and output matmul.
-        attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=True) # [B, H, Tq, d_head]
+
+        # right before attention
+        print("Q/K/V shapes:", Q.shape, K.shape, V.shape)
+        assert Q.shape == K.shape == V.shape, "Q/K/V must match exactly [B,H,T,D]"
+        assert Q.is_cuda and K.is_cuda and V.is_cuda
+        _check_finite("Q", Q); _check_finite("K", K); _check_finite("V", V)
+
+        with torch.amp.autocast("cuda", enabled=False):
+            attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=True) # [B, H, Tq, d_head]
 
         # 4. Reshape output
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, Tq, H * self.d_head) # [B, Tq, d_model]
@@ -433,14 +457,18 @@ class RegionEncoder(nn.Module):
         self.drop = nn.Dropout(drop)
 
         # The FFN and LayerNorms remain the same
-        self.ffn = GroupedFFN(num_regions=self.num_regions, d_head=self.d_head, mult=4, dropout=drop, mode="shared_global")
+        self.ffn = GroupedFFN(num_regions=self.num_regions, d_head=self.d_head, mult=4, dropout=drop, mode="shared_per_region")
         self.ln1 = nn.LayerNorm(self.d_model)
         self.ln2 = nn.LayerNorm(self.d_model)
 
-    def forward(self, src: Tensor) -> Tensor:
+    def forward(self, src: Tensor, residual_type: int) -> Tensor:
+        assert residual_type in {0, 1, 2}, "residual_type must be 0, 1, or 2"
         output = src
         for layer in self.layers:
-            residual = output
+            if residual_type == 0:
+                residual = self.ln1(output)
+            else: 
+                residual = output
             x = self.ln1(output)
 
             # A single call to the efficient parallel layer, with checkpointing
@@ -452,7 +480,10 @@ class RegionEncoder(nn.Module):
             x = residual + attn_out
             residual = x
             x = self.ffn(x)
-            output = residual + x
+            if residual_type == 2:
+                output = residual + x
+            else: 
+                output = x
         return output
 
 
@@ -475,6 +506,7 @@ class TransformerModel(nn.Module):
             if ctype == 'real' and (self.selected_columns is None or col in self.selected_columns)
         ]
 
+        self.residual_type = hparams.model_spec.residual_type
         self.use_positional_encoding = hparams.model_spec.use_positional_encoding
         self.use_embedding = hparams.model_spec.use_embedding
         self.use_cross_attention = hparams.model_spec.use_cross_attention
@@ -625,9 +657,9 @@ class TransformerModel(nn.Module):
         load_string = self._load_weights_conditional() #checkpoint loading
         self._initialize_log_file()
         self.log_file.write(load_string)
-        self.log_file.write("Using model with {} regions, {} positional encoding, {} embedding and {} cross-attention".format(len(self.real_columns),
+        self.log_file.write("Using model with {} regions, {} positional encoding, {} embedding and {} cross-attention and residual type {}".format(len(self.real_columns),
             "with" if self.use_positional_encoding else "without", "with" if self.use_embedding else "without", 
-            "with" if self.use_cross_attention else "without"))
+            "with" if self.use_cross_attention else "without", "0" if self.residual_type==0 else "1" if self.residual_type==1 else "2"))
 
     @beartype
     def _init_criterion(self, hparams: Any) -> dict[str, Any]:
@@ -797,7 +829,7 @@ class TransformerModel(nn.Module):
         else:
             assert self.use_embedding, "Cross attention requires embedding to be used"
             src2 = src2.transpose(0, 1)  # (B, T, d_model) for region encoder
-            output = self.region_encoder(src2)
+            output = self.region_encoder(src2, self.residual_type)
             output = output.transpose(0, 1)  # back to (T, B, d_model)
 
         output = {

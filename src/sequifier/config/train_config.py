@@ -249,6 +249,7 @@ class ModelSpecModel(BaseModel):
     use_positional_encoding: bool = True
     use_embedding: bool = True
     use_cross_attention: bool = False   
+    residual_type: int = 0  # 0: Pre-LN, 1: Post-LN, 2: Post-LN with residual after FFN
 
     @validator("d_model_by_column")
     def validate_d_model_by_column(cls, v, values):
