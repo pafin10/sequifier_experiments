@@ -31,13 +31,8 @@ from sequifier.helpers import read_data  # noqa: E402
 from sequifier.helpers import numpy_to_pytorch, subset_to_selected_columns  # noqa: E402
 from sequifier.optimizers.optimizers import get_optimizer_class  # noqa: E402
 
-# Flash attention breaks for fMRI data - for now disable it
-torch.backends.cuda.enable_flash_sdp(False)
-torch.backends.cuda.enable_math_sdp(True)
-torch.backends.cuda.enable_mem_efficient_sdp(False)
 
 # Change to bfloat 16 or back to float32 / decrease learning rate -> A100 & H100
-
 torch.autograd.set_detect_anomaly(True)   # pinpoints first op that creates NaN/Inf
 
 ##### DEBUGGING FUNCTIONS #####
@@ -457,7 +452,7 @@ class RegionEncoder(nn.Module):
         self.drop = nn.Dropout(drop)
 
         # The FFN and LayerNorms remain the same
-        self.ffn = GroupedFFN(num_regions=self.num_regions, d_head=self.d_head, mult=4, dropout=drop, mode="shared_per_region")
+        self.ffn = GroupedFFN(num_regions=self.num_regions, d_head=self.d_head, mult=4, dropout=drop, mode="per_region")
         self.ln1 = nn.LayerNorm(self.d_model)
         self.ln2 = nn.LayerNorm(self.d_model)
 
