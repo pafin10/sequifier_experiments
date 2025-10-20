@@ -1019,7 +1019,7 @@ class TransformerModel(nn.Module):
 
             # AMP: Enter autocast context for forward pass and loss calculation.
             # This enables automatic casting to float16 for performance.
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=(self.device == 'cuda')):
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float32, enabled=(self.device == 'cuda')):
                 output = self.forward_train(data)
                 loss, losses = self._calculate_loss(output, targets)
 
@@ -1133,7 +1133,7 @@ class TransformerModel(nn.Module):
                     self.batch_size,
                     to_device=True,
                 )
-                with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=(self.device == 'cuda')):
+                with torch.amp.autocast(device_type='cuda', dtype=torch.float32, enabled=(self.device == 'cuda')):
                     output = self.forward_train(data)
                     total_loss_iter, total_losses_iter = self._calculate_loss(
                         output, targets
